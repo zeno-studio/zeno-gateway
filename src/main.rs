@@ -19,7 +19,22 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::time::{self, Duration};
+use tokio::time::{self, Duration, Instant};
+use tower_governor::{
+    governor::GovernorConfigBuilder,
+    key_extractor::SmartIpKeyExtractor,
+    GovernorLayer,
+};
+use tower::ServiceBuilder;
+
+// Prometheus 相关导入
+use axum_prometheus::PrometheusMetricLayer;
+use prometheus::{
+    Counter, Histogram, IntCounter, IntGauge, Registry, Encoder, TextEncoder,
+    HistogramOpts, Opts, register_counter_with_registry, register_histogram_with_registry,
+    register_int_counter_with_registry, register_int_gauge_with_registry,
+};
+use metrics_exporter_prometheus::PrometheusBuilder;
 
 // 外汇 API 数据结构（精简）
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -38,6 +53,85 @@ struct RawForexData {
     rates: std::collections::HashMap<String, f64>,
 }
 
+// Prometheus 指标结构
+#[derive(Clone)]
+struct PrometheusMetrics {
+    registry: Registry,
+    http_requests_total: IntCounter,
+    http_request_duration: Histogram,
+    rpc_requests_total: IntCounter,
+    rpc_request_duration: Histogram,
+    indexer_requests_total: IntCounter,
+    indexer_request_duration: Histogram,
+    forex_updates_total: IntCounter,
+    active_connections: IntGauge,
+    rate_limit_hits: IntCounter,
+}
+
+impl PrometheusMetrics {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let registry = Registry::new();
+
+        let http_requests_total = register_int_counter_with_registry!(
+            Opts::new("http_requests_total", "Total number of HTTP requests"),
+            registry
+        )?;
+
+        let http_request_duration = register_histogram_with_registry!(
+            HistogramOpts::new("http_request_duration_seconds", "HTTP request duration in seconds"),
+            registry
+        )?;
+
+        let rpc_requests_total = register_int_counter_with_registry!(
+            Opts::new("rpc_requests_total", "Total number of RPC requests"),
+            registry
+        )?;
+
+        let rpc_request_duration = register_histogram_with_registry!(
+            HistogramOpts::new("rpc_request_duration_seconds", "RPC request duration in seconds"),
+            registry
+        )?;
+
+        let indexer_requests_total = register_int_counter_with_registry!(
+            Opts::new("indexer_requests_total", "Total number of indexer requests"),
+            registry
+        )?;
+
+        let indexer_request_duration = register_histogram_with_registry!(
+            HistogramOpts::new("indexer_request_duration_seconds", "Indexer request duration in seconds"),
+            registry
+        )?;
+
+        let forex_updates_total = register_int_counter_with_registry!(
+            Opts::new("forex_updates_total", "Total number of forex data updates"),
+            registry
+        )?;
+
+        let active_connections = register_int_gauge_with_registry!(
+            Opts::new("active_connections", "Number of active connections"),
+            registry
+        )?;
+
+        let rate_limit_hits = register_int_counter_with_registry!(
+            Opts::new("rate_limit_hits_total", "Total number of rate limit hits"),
+            registry
+        )?;
+
+        Ok(PrometheusMetrics {
+            registry,
+            http_requests_total,
+            http_request_duration,
+            rpc_requests_total,
+            rpc_request_duration,
+            indexer_requests_total,
+            indexer_request_duration,
+            forex_updates_total,
+            active_connections,
+            rate_limit_hits,
+        })
+    }
+}
+
 // 应用状态
 #[derive(Clone)]
 struct AppState {
@@ -47,7 +141,9 @@ struct AppState {
     forex_data: Arc<RwLock<ForexData>>,
     raw_forex_data: Arc<RwLock<Option<RawForexData>>>, // 存储原始 JSON
     rpc_endpoints: HashMap<String, String>,
+    metrics: PrometheusMetrics,
 }
+
 
 // 初始化 Ankr RPC 端点
 fn setup_ankr_endpoints(rpc_endpoints: &mut HashMap<String, String>, ankr_key: &str) {
@@ -100,7 +196,7 @@ fn setup_blast_endpoints(rpc_endpoints: &mut HashMap<String, String>, blast_key:
     }
 }
 
-// 自定义 RPC 代理（随机选择端点）
+// 自定义 RPC 代理
 async fn rpc_proxy(State(state): State<AppState>, req: Request<Body>) -> Response<Body> {
     let path = req.uri().path().to_string();
     let endpoint_url = match path {
@@ -133,6 +229,7 @@ async fn rpc_proxy(State(state): State<AppState>, req: Request<Body>) -> Respons
                 .unwrap();
         }
     };
+
 
     // 创建 HTTP 客户端并转发请求
     let client = Client::new();
@@ -234,6 +331,63 @@ async fn health_check() -> &'static str {
     "OK"
 }
 
+// Prometheus 指标端点
+async fn metrics_handler(State(state): State<AppState>) -> Response {
+    let encoder = TextEncoder::new();
+    let metric_families = state.metrics.registry.gather();
+    
+    match encoder.encode_to_string(&metric_families) {
+        Ok(output) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", encoder.format_type())
+            .body(Body::from(output))
+            .unwrap(),
+        Err(_) => Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::from("Failed to encode metrics"))
+            .unwrap(),
+    }
+}
+
+// 监控中间件
+async fn metrics_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let start = Instant::now();
+    let path = req.uri().path().to_string();
+    
+    // 增加HTTP请求计数
+    state.metrics.http_requests_total.inc();
+    
+    // 如果是RPC请求，也增加RPC计数
+    if path.starts_with("/rpc/") {
+        state.metrics.rpc_requests_total.inc();
+    }
+    
+    // 如果是Indexer请求，也增加Indexer计数
+    if path.starts_with("/indexer") {
+        state.metrics.indexer_requests_total.inc();
+    }
+    
+    let response = next.run(req).await;
+    
+    // 记录请求持续时间
+    let duration = start.elapsed().as_secs_f64();
+    state.metrics.http_request_duration.observe(duration);
+    
+    if path.starts_with("/rpc/") {
+        state.metrics.rpc_request_duration.observe(duration);
+    }
+    
+    if path.starts_with("/indexer") {
+        state.metrics.indexer_request_duration.observe(duration);
+    }
+    
+    response
+}
+
 // 每小时更新外汇数据
 async fn update_forex_data(state: AppState) {
     let client = Client::new();
@@ -251,6 +405,10 @@ async fn update_forex_data(state: AppState) {
                     };
                     *state.forex_data.write().await = forex_data;
                     *state.raw_forex_data.write().await = Some(raw_data);
+                    
+                    // 增加外汇更新计数
+                    state.metrics.forex_updates_total.inc();
+                    
                     println!("Updated forex data: {:?}", state.forex_data.read().await);
                 } else {
                     println!("Failed to parse forex JSON");
@@ -292,6 +450,9 @@ async fn main() {
     setup_ankr_endpoints(&mut rpc_endpoints, &ankr_key);
     setup_blast_endpoints(&mut rpc_endpoints, &blast_key);
 
+    // 初始化 Prometheus 指标
+    let metrics = PrometheusMetrics::new().expect("Failed to create Prometheus metrics");
+
     // 初始化应用状态
     let state = AppState {
         ankr_key,
@@ -303,6 +464,7 @@ async fn main() {
         })),
         raw_forex_data: Arc::new(RwLock::new(None)),
         rpc_endpoints,
+        metrics,
     };
 
     // 定时更新外汇数据
@@ -310,15 +472,102 @@ async fn main() {
 
     let indexer_url = format!("https://rpc.ankr.com/multichain/{}", state.ankr_key);
 
-    // 路由
-    let app = Router::new()
+    // 配置不同的速率限制
+    
+    // RPC路由：30 RPS
+    let rpc_governor_conf = GovernorConfigBuilder::default()
+        .per_second(30)
+        .burst_size(30)
+        .key_extractor(SmartIpKeyExtractor)
+        .finish()
+        .unwrap();
+    
+    let rpc_rate_limit_layer = ServiceBuilder::new()
+        .layer(GovernorLayer {
+            config: Arc::new(rpc_governor_conf),
+        });
+
+    // Indexer路由：10 RPS
+    let indexer_governor_conf = GovernorConfigBuilder::default()
+        .per_second(10)
+        .burst_size(10)
+        .key_extractor(SmartIpKeyExtractor)
+        .finish()
+        .unwrap();
+    
+    let indexer_rate_limit_layer = ServiceBuilder::new()
+        .layer(GovernorLayer {
+            config: Arc::new(indexer_governor_conf),
+        });
+
+    // Forex路由：1次/分钟 (1/60秒)
+    let forex_governor_conf = GovernorConfigBuilder::default()
+        .per_second(1)
+        .burst_size(1)
+        .period(Duration::from_secs(60)) // 60秒窗口期
+        .key_extractor(SmartIpKeyExtractor)
+        .finish()
+        .unwrap();
+
+   
+    let forex_rate_limit_layer = ServiceBuilder::new()
+        .layer(GovernorLayer {
+            config: Arc::new(forex_governor_conf),
+        });
+
+     // health路由：10 RPS
+    let health_governor_conf = GovernorConfigBuilder::default()
+        .per_second(10)
+        .burst_size(10)
+        .key_extractor(SmartIpKeyExtractor)
+        .finish()
+        .unwrap();
+
+    
+    let health_rate_limit_layer = ServiceBuilder::new()
+        .layer(GovernorLayer {
+            config: Arc::new(health_governor_conf),
+        });
+    
+
+
+    // RPC路由（30 RPS）
+    let rpc_routes = Router::new()
         .route("/rpc/ankr/{*path}", get(rpc_proxy).post(rpc_proxy))
         .route("/rpc/blast/{*path}", get(rpc_proxy).post(rpc_proxy))
+        .with_state(state.clone())
+        .layer(rpc_rate_limit_layer);
+
+    // Indexer路由（10 RPS）
+    let indexer_routes = Router::new()
         .merge(ReverseProxy::new("/indexer", &indexer_url))
+        .with_state(state.clone())
+        .layer(indexer_rate_limit_layer);
+
+    // Forex路由（1次/分钟）
+    let forex_routes = Router::new()
         .route("/forex", get(get_forex_data))
         .route("/forex/raw", get(get_raw_forex_data))
-        .route("/health", get(health_check))
         .with_state(state.clone())
+        .layer(forex_rate_limit_layer);
+
+    // health检查和metrics
+    let health_routes = Router::new()
+        .route("/health", get(health_check))
+        .route("/metrics", get(metrics_handler))
+        .with_state(state.clone())
+        .layer(health_rate_limit_layer);
+
+
+
+
+    // 合并所有路由
+    let app = Router::new()
+        .merge(rpc_routes)
+        .merge(indexer_routes)
+        .merge(forex_routes)
+        .merge(health_routes)
+        .layer(middleware::from_fn_with_state(state.clone(), metrics_middleware))
         .layer(middleware::from_fn_with_state(state, add_headers))
         .layer(middleware::from_fn(domain_filter));
 
@@ -401,4 +650,5 @@ async fn main() {
         .await
         .unwrap();
     }
+
 }
