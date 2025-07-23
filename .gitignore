@@ -24,3 +24,6 @@ target
 # Added by cargo
 
 /target
+
+# ACME证书缓存目录
+acme-cache/
