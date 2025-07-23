@@ -64,6 +64,20 @@ pub fn setup_blast_endpoints(rpc_endpoints: &mut HashMap<String, String>, blast_
     }
 }
 
+// 初始化 indexer 端点
+pub fn setup_indexer_endpoints(indexer_endpoints: &mut HashMap<String, String>, ankr_key: &str) {
+    let endpoints = vec![
+        (
+            "ankr",
+            format!("https://rpc.ankr.com/multichain/{}",  ankr_key),
+        ),
+    ];
+
+    for (endpoint_name, url) in endpoints {
+        indexer_endpoints.insert(endpoint_name.to_string(), url);
+    }
+}
+
 pub async fn rpc_proxy(State(state): State<AppState>, req: Request<Body>) -> Response<Body> {
     let path = req.uri().path().to_string();
     let endpoint_url = match path {
@@ -89,6 +103,63 @@ pub async fn rpc_proxy(State(state): State<AppState>, req: Request<Body>) -> Res
         p if p.starts_with("/rpc/blast/polygon") => {
             state.rpc_endpoints.get("blast_polygon").unwrap()
         }
+        _ => {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::from("Not Found"))
+                .unwrap();
+        }
+    };
+
+    // 创建 HTTP 客户端并转发请求
+    let client = Client::new();
+    let method = req.method().clone();
+    let headers = req.headers().clone();
+    let body = axum::body::to_bytes(req.into_body(), usize::MAX)
+        .await
+        .unwrap_or_default();
+
+    let mut request_builder = client.request(method, endpoint_url);
+
+    // 复制请求头
+    for (name, value) in headers.iter() {
+        if name != "host" && name != "content-length" {
+            request_builder = request_builder.header(name, value);
+        }
+    }
+
+    // 发送请求
+    match request_builder.body(body).send().await {
+        Ok(response) => {
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = response.bytes().await.unwrap_or_default();
+
+            let mut response_builder = Response::builder().status(status);
+
+            // 复制响应头
+            for (name, value) in headers.iter() {
+                if name != "content-length" && name != "transfer-encoding" {
+                    response_builder = response_builder.header(name, value);
+                }
+            }
+
+            response_builder.body(Body::from(body)).unwrap()
+        }
+        Err(_) => Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Body::from("Bad Gateway"))
+            .unwrap(),
+    }
+}
+
+
+
+
+pub async fn indexer_proxy(State(state): State<AppState>, req: Request<Body>) -> Response<Body> {
+    let path = req.uri().path().to_string();
+    let endpoint_url = match path {
+        p if p.starts_with("/indexer/ankr") => state.indexer_endpoints.get("ankr").unwrap(),     
         _ => {
             return Response::builder()
                 .status(StatusCode::NOT_FOUND)

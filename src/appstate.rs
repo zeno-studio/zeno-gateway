@@ -17,6 +17,7 @@ pub struct AppState {
     pub forex_data: Arc<RwLock<ForexData>>,
     pub raw_forex_data: Arc<RwLock<Option<RawForexData>>>, // 存储原始 JSON
     pub rpc_endpoints: HashMap<String, String>,
+    pub indexer_endpoints: HashMap<String, String>,
     pub metrics: PrometheusMetrics,
 }
 

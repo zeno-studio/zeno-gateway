@@ -17,7 +17,7 @@ mod appstate;
 use appstate::{AppState, ForexData, PrometheusMetrics};
 
 mod endpoint;
-use endpoint::{rpc_proxy, setup_ankr_endpoints, setup_blast_endpoints};
+use endpoint::{rpc_proxy, indexer_proxy,setup_ankr_endpoints, setup_blast_endpoints, setup_indexer_endpoints};
 
 mod prometheus;
 use prometheus::{metrics_handler, metrics_middleware};
@@ -53,8 +53,10 @@ async fn main() {
 
     // 初始化 RPC 端点
     let mut rpc_endpoints = HashMap::new();
+    let mut indexer_endpoints = HashMap::new();
     setup_ankr_endpoints(&mut rpc_endpoints, &ankr_key);
     setup_blast_endpoints(&mut rpc_endpoints, &blast_key);
+    setup_indexer_endpoints(&mut indexer_endpoints, &ankr_key);
 
     // 初始化 Prometheus 指标
     let metrics = PrometheusMetrics::new().expect("Failed to create Prometheus metrics");
@@ -70,13 +72,13 @@ async fn main() {
         })),
         raw_forex_data: Arc::new(RwLock::new(None)),
         rpc_endpoints,
+        indexer_endpoints, // 初始化 indexer_endpoints
         metrics,
     };
 
     // 定时更新外汇数据
     tokio::spawn(update_forex_data(state.clone()));
 
-    let indexer_url = format!("https://rpc.ankr.com/multichain/{}", state.ankr_key);
 
     // 配置不同的速率限制
 
@@ -138,7 +140,7 @@ async fn main() {
 
     // Indexer路由（10 RPS）
     let indexer_routes = Router::new()
-        .merge(ReverseProxy::new("/indexer", &indexer_url))
+        .route("/indexer/{*path}", get(indexer_proxy).post(indexer_proxy))
         .with_state(state.clone())
         .layer(indexer_rate_limit_layer);
 
