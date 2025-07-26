@@ -1,18 +1,17 @@
-// Prometheus 相关导入
-
-use prometheus::{Encoder, TextEncoder};
-
+use prometheus::{Encoder, TextEncoder, CounterVec, HistogramVec};
 use axum::{
     body::Body,
     extract::{Request, State},
     http::StatusCode,
     response::Response,
 };
-
-use crate::appstate::AppState;
 use tokio::time::Instant;
 
-// Prometheus 指标端点
+use crate::appstate::AppState;
+
+
+
+// Prometheus metrics handler
 pub async fn metrics_handler(State(state): State<AppState>) -> Response {
     let encoder = TextEncoder::new();
     let metric_families = state.metrics.registry.gather();
@@ -23,47 +22,41 @@ pub async fn metrics_handler(State(state): State<AppState>) -> Response {
             .header("content-type", encoder.format_type())
             .body(Body::from(output))
             .unwrap(),
-        Err(_) => Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(Body::from("Failed to encode metrics"))
-            .unwrap(),
+        Err(e) => {
+            println!("Failed to encode Prometheus metrics: {}", e);
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from(format!("Failed to encode metrics: {}", e)))
+                .unwrap()
+        }
     }
 }
 
+// Prometheus metrics middleware
 pub async fn metrics_middleware(
     State(state): State<AppState>,
     req: Request,
     next: axum::middleware::Next,
 ) -> Response {
     let start = Instant::now();
-    let path = req.uri().path().to_string();
+    let path = req.uri().path();
+    let method = req.method().as_str();
 
-    // 增加HTTP请求计数
-    state.metrics.http_requests_total.inc();
-
-    // 如果是RPC请求，也增加RPC计数
-    if path.starts_with("/rpc/") {
-        state.metrics.rpc_requests_total.inc();
+    // Increment request counter (exclude /metrics endpoint)
+    if !path.starts_with("/metrics") {
+        state.metrics.http_requests_total.with_label_values(&[path, method, "pending"]).inc();
     }
 
-    // 如果是Indexer请求，也增加Indexer计数
-    if path.starts_with("/indexer") {
-        state.metrics.indexer_requests_total.inc();
-    }
-
+    // Clone the parts we need before consuming the request
+    let path_clone = path.to_owned();
+    let method_clone = method.to_owned();
+    
+    // Run the next handler, consuming req
     let response = next.run(req).await;
 
-    // 记录请求持续时间
+    // Record request duration
     let duration = start.elapsed().as_secs_f64();
-    state.metrics.http_request_duration.observe(duration);
-
-    if path.starts_with("/rpc/") {
-        state.metrics.rpc_request_duration.observe(duration);
-    }
-
-    if path.starts_with("/indexer") {
-        state.metrics.indexer_request_duration.observe(duration);
-    }
-
+    let status = response.status().as_u16().to_string();
+    state.metrics.http_request_duration.with_label_values(&[&path_clone, &method_clone, &status]).observe(duration);
     response
 }

@@ -2,19 +2,21 @@ use std::collections::HashMap;
 
 use axum::{
     body::Body,
-    extract::{Request, State},
+    extract::{Path, Request, State},
     http::StatusCode,
     response::Response,
 };
 
-use reqwest::Client;
-
-// 应用状态
 
 use crate::appstate::AppState;
 
-// 初始化 Ankr RPC 端点
+// Initialize Ankr RPC endpoints
 pub fn setup_ankr_endpoints(rpc_endpoints: &mut HashMap<String, String>, ankr_key: &str) {
+    if ankr_key.is_empty() {
+        println!("Warning: ANKR_API_KEY is empty, skipping Ankr endpoints");
+        return;
+    }
+
     let chains = vec![
         ("ankr_eth", "eth"),
         ("ankr_bsc", "bsc"),
@@ -30,8 +32,13 @@ pub fn setup_ankr_endpoints(rpc_endpoints: &mut HashMap<String, String>, ankr_ke
     }
 }
 
-// 初始化 Blast RPC 端点
+// Initialize Blast RPC endpoints
 pub fn setup_blast_endpoints(rpc_endpoints: &mut HashMap<String, String>, blast_key: &str) {
+    if blast_key.is_empty() {
+        println!("Warning: BLAST_API_KEY is empty, skipping Blast endpoints");
+        return;
+    }
+
     let endpoints = vec![
         (
             "blast_eth",
@@ -64,12 +71,17 @@ pub fn setup_blast_endpoints(rpc_endpoints: &mut HashMap<String, String>, blast_
     }
 }
 
-// 初始化 indexer 端点
+// Initialize indexer endpoints
 pub fn setup_indexer_endpoints(indexer_endpoints: &mut HashMap<String, String>, ankr_key: &str) {
+    if ankr_key.is_empty() {
+        println!("Warning: ANKR_API_KEY is empty, skipping indexer endpoints");
+        return;
+    }
+
     let endpoints = vec![
         (
             "ankr",
-            format!("https://rpc.ankr.com/multichain/{}",  ankr_key),
+            format!("https://rpc.ankr.com/multichain/{}", ankr_key),
         ),
     ];
 
@@ -78,67 +90,72 @@ pub fn setup_indexer_endpoints(indexer_endpoints: &mut HashMap<String, String>, 
     }
 }
 
-pub async fn rpc_proxy(State(state): State<AppState>, req: Request<Body>) -> Response<Body> {
-    let path = req.uri().path().to_string();
-    let endpoint_url = match path {
-        p if p.starts_with("/rpc/ankr/eth") => state.rpc_endpoints.get("ankr_eth").unwrap(),
-        p if p.starts_with("/rpc/ankr/bsc") => state.rpc_endpoints.get("ankr_bsc").unwrap(),
-        p if p.starts_with("/rpc/ankr/arbitrum") => {
-            state.rpc_endpoints.get("ankr_arbitrum").unwrap()
-        }
-        p if p.starts_with("/rpc/ankr/optimism") => {
-            state.rpc_endpoints.get("ankr_optimism").unwrap()
-        }
-        p if p.starts_with("/rpc/ankr/base") => state.rpc_endpoints.get("ankr_base").unwrap(),
-        p if p.starts_with("/rpc/ankr/polygon") => state.rpc_endpoints.get("ankr_polygon").unwrap(),
-        p if p.starts_with("/rpc/blast/eth") => state.rpc_endpoints.get("blast_eth").unwrap(),
-        p if p.starts_with("/rpc/blast/bsc") => state.rpc_endpoints.get("blast_bsc").unwrap(),
-        p if p.starts_with("/rpc/blast/arbitrum") => {
-            state.rpc_endpoints.get("blast_arbitrum").unwrap()
-        }
-        p if p.starts_with("/rpc/blast/optimism") => {
-            state.rpc_endpoints.get("blast_optimism").unwrap()
-        }
-        p if p.starts_with("/rpc/blast/base") => state.rpc_endpoints.get("blast_base").unwrap(),
-        p if p.starts_with("/rpc/blast/polygon") => {
-            state.rpc_endpoints.get("blast_polygon").unwrap()
-        }
-        _ => {
+// Shared proxy logic
+async fn proxy_request(
+    state: AppState,
+    req: Request<Body>,
+    endpoint_url: &str,
+    path: &str,
+    method: &str,
+) -> Response<Body> {
+    const MAX_BODY_SIZE: usize = 1_000_000; // 1MB
+    const MAX_HEADER_COUNT: usize = 50; // Limit to 50 headers
+    const MAX_HEADER_SIZE: usize = 1024; // Limit header value to 1KB
+
+    println!("Proxying request: method={}, path={}", method, path);
+
+    // Clone headers before consuming req
+    let headers = req.headers().clone();
+    let method = req.method().clone();
+
+    // Read request body with size limit
+    let body = match axum::body::to_bytes(req.into_body(), MAX_BODY_SIZE).await {
+        Ok(body) => body,
+        Err(_) => {
             return Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Body::from("Not Found"))
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .body(Body::from("Request body too large (max 1MB)"))
                 .unwrap();
         }
     };
 
-    // 创建 HTTP 客户端并转发请求
-    let client = Client::new();
-    let method = req.method().clone();
-    let headers = req.headers().clone();
-    let body = axum::body::to_bytes(req.into_body(), usize::MAX)
-        .await
-        .unwrap_or_default();
-
+    let client = &state.client;
     let mut request_builder = client.request(method, endpoint_url);
 
-    // 复制请求头
-    for (name, value) in headers.iter() {
-        if name != "host" && name != "content-length" {
+    // Copy request headers with limits
+    for (name, value) in headers.iter().take(MAX_HEADER_COUNT) {
+        if name != "host" && name != "content-length" && value.as_bytes().len() <= MAX_HEADER_SIZE {
             request_builder = request_builder.header(name, value);
         }
     }
 
-    // 发送请求
+    // Send request
     match request_builder.body(body).send().await {
         Ok(response) => {
             let status = response.status();
             let headers = response.headers().clone();
-            let body = response.bytes().await.unwrap_or_default();
+
+            // Read response body with size limit
+            let body = match response.bytes().await {
+                Ok(body) if body.len() <= MAX_BODY_SIZE => body,
+                Ok(_) => {
+                    return Response::builder()
+                        .status(StatusCode::PAYLOAD_TOO_LARGE)
+                        .body(Body::from("Response body too large (max 1MB)"))
+                        .unwrap();
+                }
+                Err(e) => {
+                    println!("Failed to read response body: {}", e);
+                    return Response::builder()
+                        .status(StatusCode::BAD_GATEWAY)
+                        .body(Body::from(format!("Bad Gateway: {}", e)))
+                        .unwrap();
+                }
+            };
 
             let mut response_builder = Response::builder().status(status);
-
-            // 复制响应头
-            for (name, value) in headers.iter() {
+            // Copy response headers with limits
+            for (name, value) in headers.iter().take(MAX_HEADER_COUNT) {
                 if name != "content-length" && name != "transfer-encoding" {
                     response_builder = response_builder.header(name, value);
                 }
@@ -146,66 +163,57 @@ pub async fn rpc_proxy(State(state): State<AppState>, req: Request<Body>) -> Res
 
             response_builder.body(Body::from(body)).unwrap()
         }
-        Err(_) => Response::builder()
-            .status(StatusCode::BAD_GATEWAY)
-            .body(Body::from("Bad Gateway"))
-            .unwrap(),
+        Err(e) => {
+            println!("Proxy request failed: {}", e);
+            Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from(format!("Bad Gateway: {}", e)))
+                .unwrap()
+        }
     }
 }
 
-
-
-
-pub async fn indexer_proxy(State(state): State<AppState>, req: Request<Body>) -> Response<Body> {
-    let path = req.uri().path().to_string();
-    let endpoint_url = match path {
-        p if p.starts_with("/indexer/ankr") => state.indexer_endpoints.get("ankr").unwrap(),     
-        _ => {
+pub async fn rpc_proxy(
+    State(state): State<AppState>,
+    Path((provider, chain)): Path<(String, String)>,
+    req: Request<Body>,
+) -> Response<Body> {
+    let endpoint_key = format!("{}_{}", provider, chain);
+    let endpoint_url = match state.rpc_endpoints.get(&endpoint_key) {
+        Some(url) => url.to_owned(),
+        None => {
             return Response::builder()
                 .status(StatusCode::NOT_FOUND)
-                .body(Body::from("Not Found"))
+                .body(Body::from("Endpoint not configured"))
                 .unwrap();
         }
     };
 
-    // 创建 HTTP 客户端并转发请求
-    let client = Client::new();
-    let method = req.method().clone();
-    let headers = req.headers().clone();
-    let body = axum::body::to_bytes(req.into_body(), usize::MAX)
-        .await
-        .unwrap_or_default();
+    let path = req.uri().path().to_string();
+    let method = req.method().as_str().to_owned();
+    let endpoint_url_clone = endpoint_url.clone();
+    
+    proxy_request(state, req, &endpoint_url_clone, &path, &method).await
+}
 
-    let mut request_builder = client.request(method, endpoint_url);
-
-    // 复制请求头
-    for (name, value) in headers.iter() {
-        if name != "host" && name != "content-length" {
-            request_builder = request_builder.header(name, value);
+pub async fn indexer_proxy(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    req: Request<Body>,
+) -> Response<Body> {
+    let endpoint_url = match state.indexer_endpoints.get(&provider) {
+        Some(url) => url.to_owned(),
+        None => {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::from("Endpoint not configured"))
+                .unwrap();
         }
-    }
+    };
 
-    // 发送请求
-    match request_builder.body(body).send().await {
-        Ok(response) => {
-            let status = response.status();
-            let headers = response.headers().clone();
-            let body = response.bytes().await.unwrap_or_default();
-
-            let mut response_builder = Response::builder().status(status);
-
-            // 复制响应头
-            for (name, value) in headers.iter() {
-                if name != "content-length" && name != "transfer-encoding" {
-                    response_builder = response_builder.header(name, value);
-                }
-            }
-
-            response_builder.body(Body::from(body)).unwrap()
-        }
-        Err(_) => Response::builder()
-            .status(StatusCode::BAD_GATEWAY)
-            .body(Body::from("Bad Gateway"))
-            .unwrap(),
-    }
+    let path = req.uri().path().to_string();
+    let method = req.method().as_str().to_owned();
+    let endpoint_url_clone = endpoint_url.clone();
+    
+    proxy_request(state, req, &endpoint_url_clone, &path, &method).await
 }

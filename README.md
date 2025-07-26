@@ -1,6 +1,6 @@
 # Zeno Gateway
 
-A high-performance API gateway built with Rust.
+Zeno Wallet's API gateway built with Rust.
 
 ## Development
 

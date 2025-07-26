@@ -28,10 +28,6 @@ WORKDIR /app
 # Copy the binary from builder
 COPY --from=builder /usr/src/zeno-gateway/target/release/zeno-gateway /app/
 
-# Create volume for ACME cache
-RUN mkdir -p /app/acme-cache && \
-    chown nobody:nogroup /app/acme-cache && \
-    chmod 755 /app/acme-cache
 
 # Use an unprivileged user
 USER nobody
@@ -39,8 +35,6 @@ USER nobody
 # Expose both HTTP and HTTPS ports
 EXPOSE 3000 8443
 
-# Set volumes
-VOLUME ["/app/acme-cache"]
 
 # Set the entry point
 ENTRYPOINT ["/app/zeno-gateway"]

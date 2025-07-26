@@ -1,13 +1,9 @@
-
-use prometheus::{
-     Histogram, HistogramOpts, IntCounter, IntGauge, Opts, Registry, 
-    register_histogram_with_registry,
-    register_int_counter_with_registry, register_int_gauge_with_registry,
-};
+use prometheus::{CounterVec, HistogramVec};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use reqwest::Client;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -19,6 +15,7 @@ pub struct AppState {
     pub rpc_endpoints: HashMap<String, String>,
     pub indexer_endpoints: HashMap<String, String>,
     pub metrics: PrometheusMetrics,
+    pub client: Client,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -37,90 +34,42 @@ pub struct RawForexData {
    pub  rates: std::collections::HashMap<String, f64>,
 }
 
-// Prometheus 指标结构
-#[derive(Clone)]
+
+#[derive(Debug, Clone,)]
 pub struct PrometheusMetrics {
-    pub registry: Registry,
-    pub http_requests_total: IntCounter,
-    pub http_request_duration: Histogram,
-    pub rpc_requests_total: IntCounter,
-    pub rpc_request_duration: Histogram,
-    pub indexer_requests_total: IntCounter,
-    pub indexer_request_duration: Histogram,
-    pub forex_updates_total: IntCounter,
-    pub active_connections: IntGauge,
-    pub rate_limit_hits: IntCounter,
+    pub http_requests_total: CounterVec,
+    pub http_request_duration: HistogramVec,
+    pub registry: prometheus::Registry,
 }
 
 impl PrometheusMetrics {
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let registry = Registry::new();
-
-        let http_requests_total = register_int_counter_with_registry!(
-            Opts::new("http_requests_total", "Total number of HTTP requests"),
-            registry
-        )?;
-
-        let http_request_duration = register_histogram_with_registry!(
-            HistogramOpts::new(
+    pub fn new() -> Self {
+        let http_requests_total = CounterVec::new(
+            prometheus::Opts::new(
+                "http_requests_total",
+                "Total number of HTTP requests",
+            ),
+            &["path", "method", "status"],
+        )
+        .unwrap();
+        let http_request_duration = HistogramVec::new(
+            prometheus::HistogramOpts::new(
                 "http_request_duration_seconds",
-                "HTTP request duration in seconds"
-            ),
-            registry
-        )?;
+                "HTTP request duration in seconds",
+            )
+            .buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]),
+            &["path", "method", "status"],
+        )
+        .unwrap();
 
-        let rpc_requests_total = register_int_counter_with_registry!(
-            Opts::new("rpc_requests_total", "Total number of RPC requests"),
-            registry
-        )?;
+        let registry = prometheus::Registry::new();
+        registry.register(Box::new(http_requests_total.clone())).unwrap();
+        registry.register(Box::new(http_request_duration.clone())).unwrap();
 
-        let rpc_request_duration = register_histogram_with_registry!(
-            HistogramOpts::new(
-                "rpc_request_duration_seconds",
-                "RPC request duration in seconds"
-            ),
-            registry
-        )?;
-
-        let indexer_requests_total = register_int_counter_with_registry!(
-            Opts::new("indexer_requests_total", "Total number of indexer requests"),
-            registry
-        )?;
-
-        let indexer_request_duration = register_histogram_with_registry!(
-            HistogramOpts::new(
-                "indexer_request_duration_seconds",
-                "Indexer request duration in seconds"
-            ),
-            registry
-        )?;
-
-        let forex_updates_total = register_int_counter_with_registry!(
-            Opts::new("forex_updates_total", "Total number of forex data updates"),
-            registry
-        )?;
-
-        let active_connections = register_int_gauge_with_registry!(
-            Opts::new("active_connections", "Number of active connections"),
-            registry
-        )?;
-
-        let rate_limit_hits = register_int_counter_with_registry!(
-            Opts::new("rate_limit_hits_total", "Total number of rate limit hits"),
-            registry
-        )?;
-
-        Ok(PrometheusMetrics {
-            registry,
+        Self {
             http_requests_total,
             http_request_duration,
-            rpc_requests_total,
-            rpc_request_duration,
-            indexer_requests_total,
-            indexer_request_duration,
-            forex_updates_total,
-            active_connections,
-            rate_limit_hits,
-        })
+            registry,
+        }
     }
 }
