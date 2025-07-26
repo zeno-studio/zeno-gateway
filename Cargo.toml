@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-acme2 = "0.5.1"
 axum = "0.8.4"
 axum-reverse-proxy = { version = "1.0.3", features = ["tls"] }
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
@@ -22,11 +21,10 @@ tokio-rustls = "0.26.2"
 tower = "0.5.1"
 tower-http = { version = "0.5.0", features = ["full"] }
 tower_governor = "0.7.0"
-# 日志记录
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
 # Prometheus 监控
 axum-prometheus = "0.7.0"
 prometheus = "0.13"
 metrics = "0.23"
 metrics-exporter-prometheus = "0.15"
+

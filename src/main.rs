@@ -1,7 +1,7 @@
 use axum::{Router, middleware, routing::get};
-use axum_reverse_proxy::ReverseProxy;
 use axum_server::tls_rustls::RustlsConfig;
 use dotenv::dotenv;
+use reqwest::Client;
 use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
@@ -18,7 +18,9 @@ mod appstate;
 use appstate::{AppState, ForexData, PrometheusMetrics};
 
 mod endpoint;
-use endpoint::{rpc_proxy, setup_ankr_endpoints, setup_blast_endpoints};
+use endpoint::{
+    indexer_proxy, rpc_proxy, setup_ankr_endpoints, setup_blast_endpoints, setup_indexer_endpoints,
+};
 
 mod prometheus;
 use prometheus::{metrics_handler, metrics_middleware};
@@ -27,7 +29,7 @@ mod forex;
 use forex::{get_forex_data, get_raw_forex_data, update_forex_data};
 
 mod filter;
-use filter::{add_headers, domain_filter, health_check};
+use filter::{add_headers, domain_filter, health_check, restrict_metrics};
 
 #[tokio::main]
 async fn main() {
@@ -40,11 +42,10 @@ async fn main() {
 
     // 初始化 RPC 端点
     let mut rpc_endpoints = HashMap::new();
+    let mut indexer_endpoints = HashMap::new();
     setup_ankr_endpoints(&mut rpc_endpoints, &ankr_key);
     setup_blast_endpoints(&mut rpc_endpoints, &blast_key);
-
-    // 初始化 Prometheus 指标
-    let metrics = PrometheusMetrics::new().expect("Failed to create Prometheus metrics");
+    setup_indexer_endpoints(&mut indexer_endpoints, &ankr_key);
 
     // 初始化应用状态
     let state = AppState {
@@ -57,13 +58,17 @@ async fn main() {
         })),
         raw_forex_data: Arc::new(RwLock::new(None)),
         rpc_endpoints,
-        metrics,
+        indexer_endpoints, // 初始化 indexer_endpoints
+        metrics: PrometheusMetrics::new(),
+        client: Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("Failed to build reqwest client"),
     };
 
     // 定时更新外汇数据
     tokio::spawn(update_forex_data(state.clone()));
-
-    let indexer_url = format!("https://rpc.ankr.com/multichain/{}", state.ankr_key);
 
     // 配置不同的速率限制
 
@@ -91,23 +96,21 @@ async fn main() {
         config: Arc::new(indexer_governor_conf),
     });
 
-    // Forex路由：1次/分钟 (1/60秒)
+    // Forex路由：1rps
     let forex_governor_conf = GovernorConfigBuilder::default()
-        .per_second(1)
-        .burst_size(1)
-        .period(Duration::from_secs(60)) // 60秒窗口期
+        .per_second(5)
+        .burst_size(5)
         .key_extractor(SmartIpKeyExtractor)
         .finish()
         .unwrap();
-
     let forex_rate_limit_layer = ServiceBuilder::new().layer(GovernorLayer {
         config: Arc::new(forex_governor_conf),
     });
 
     // health路由：10 RPS
     let health_governor_conf = GovernorConfigBuilder::default()
-        .per_second(10)
-        .burst_size(10)
+        .per_second(3)
+        .burst_size(3)
         .key_extractor(SmartIpKeyExtractor)
         .finish()
         .unwrap();
@@ -118,18 +121,19 @@ async fn main() {
 
     // RPC路由（30 RPS）
     let rpc_routes = Router::new()
-        .route("/rpc/ankr/{*path}", get(rpc_proxy).post(rpc_proxy))
-        .route("/rpc/blast/{*path}", get(rpc_proxy).post(rpc_proxy))
+        .route("/rpc/{provider}/{chain}", get(rpc_proxy).post(rpc_proxy))
         .with_state(state.clone())
         .layer(rpc_rate_limit_layer);
 
     // Indexer路由（10 RPS）
     let indexer_routes = Router::new()
-        .merge(ReverseProxy::new("/indexer", &indexer_url))
+        .route(
+            "/indexer/{provider}",
+            get(indexer_proxy).post(indexer_proxy),
+        )
         .with_state(state.clone())
         .layer(indexer_rate_limit_layer);
 
-    // Forex路由（1次/分钟）
     let forex_routes = Router::new()
         .route("/forex", get(get_forex_data))
         .route("/forex/raw", get(get_raw_forex_data))
@@ -156,76 +160,54 @@ async fn main() {
         .layer(middleware::from_fn_with_state(state.clone(), add_headers))
         .layer(middleware::from_fn(domain_filter));
 
-    // TLS 证书路径配置（支持多种配置方式）
-    let cert_path_str = env::var("TLS_CERT_PATH").unwrap_or_else(|_| {
-        // 按优先级检查多个可能的证书路径
-        let possible_paths = [
-            "/etc/ssl/certs/zeno-gateway.crt",  // 系统级证书路径
-            "/opt/zeno-gateway/certs/cert.pem", // 应用专用目录
-            "./certs/cert.pem",                 // 项目子目录
-            "./cert.pem",                       // 项目根目录（当前默认）
-        ];
-
-        for path in &possible_paths {
-            if Path::new(path).exists() {
-                return path.to_string();
-            }
-        }
-
-        "cert.pem".to_string() // 默认回退到项目根目录
-    });
-
-    let key_path_str = env::var("TLS_KEY_PATH").unwrap_or_else(|_| {
-        // 按优先级检查多个可能的私钥路径
-        let possible_paths = [
-            "/etc/ssl/private/zeno-gateway.key", // 系统级私钥路径
-            "/opt/zeno-gateway/certs/key.pem",   // 应用专用目录
-            "./certs/key.pem",                   // 项目子目录
-            "./key.pem",                         // 项目根目录（当前默认）
-        ];
-
-        for path in &possible_paths {
-            if Path::new(path).exists() {
-                return path.to_string();
-            }
-        }
-
-        "key.pem".to_string() // 默认回退到项目根目录
-    });
+    let cert_path_str = env::var("TLS_CERT_PATH").unwrap_or("./cert.pem".to_string());
+    let key_path_str = env::var("TLS_KEY_PATH").unwrap_or("./key.pem".to_string());
 
     let cert_path = Path::new(&cert_path_str);
     let key_path = Path::new(&key_path_str);
 
-    if cert_path.exists() && key_path.exists() {
-        // 启动 HTTPS 服务器
-        let tls_config = RustlsConfig::from_pem_file(cert_path, key_path)
-            .await
-            .expect("Failed to load TLS certificates");
+    if cert_path.is_file() && key_path.is_file() {
+        match std::fs::metadata(cert_path).and_then(|_| std::fs::metadata(key_path)) {
+            Ok(_) => match RustlsConfig::from_pem_file(cert_path, key_path).await {
+                Ok(tls_config) => {
+                    println!("Current user: {:?}", std::env::var("USER"));
+                    println!("TLS certificates loaded successfully:");
+                    println!("  Certificate: {}", cert_path.display());
+                    println!("  Private Key: {}", key_path.display());
+                    println!("Server running on https://0.0.0.0:8443");
 
-        println!("TLS certificates found:");
-        println!("  Certificate: {}", cert_path.display());
-        println!("  Private Key: {}", key_path.display());
-        println!("Server running on https://0.0.0.0:8443");
-
-        axum_server::bind_rustls("0.0.0.0:8443".parse().unwrap(), tls_config)
-            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-            .await
-            .unwrap();
+                    axum_server::bind_rustls("0.0.0.0:8443".parse().unwrap(), tls_config)
+                        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                        .await
+                        .unwrap();
+                }
+                Err(e) => {
+                    println!("Failed to load TLS certificates: {}", e);
+                    println!("Falling back to HTTP server on http://0.0.0.0:3000...");
+                    start_http_server(app).await;
+                }
+            },
+            Err(e) => {
+                println!("Cannot access certificate or key files: {}", e);
+                println!("  Certificate: {}", cert_path.display());
+                println!("  Private Key: {}", key_path.display());
+                println!("Falling back to HTTP server on http://0.0.0.0:3000...");
+                start_http_server(app).await;
+            }
+        }
     } else {
-        // 如果没有证书文件，启动 HTTP 服务器（用于开发/测试）
-        println!("TLS certificates not found. Checked paths:");
-        println!("  Certificate: {}", cert_path.display());
-        println!("  Private Key: {}", key_path.display());
-        println!();
-        println!("Starting HTTP server for development/testing...");
-        println!("For production HTTPS, provide certificates using one of these methods:");
-        println!("  1. Environment variables: TLS_CERT_PATH and TLS_KEY_PATH");
-        println!("  2. Place files in: /etc/ssl/certs/ and /etc/ssl/private/");
-        println!("  3. Place files in: /opt/zeno-gateway/certs/");
-        println!("  4. Place files in: ./certs/ (project subdirectory)");
-        println!("  5. Place files in: ./ (project root directory)");
-        println!();
+        println!("Certificate or key file not found:");
+        if !cert_path.is_file() {
+            println!("  Certificate: {} (not a file)", cert_path.display());
+        }
+        if !key_path.is_file() {
+            println!("  Private Key: {} (not a file)", key_path.display());
+        }
+        println!("Falling back to HTTP server on http://0.0.0.0:3000...");
+        start_http_server(app).await;
+    }
 
+    async fn start_http_server(app: Router) {
         let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
         println!("Server running on http://0.0.0.0:3000");
         axum::serve(

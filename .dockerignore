@@ -1,0 +1,22 @@
+# .dockerignore
+# Git
+.git
+.gitignore
+
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Environment files
+.env
+*.pem
+*.key
+
+# IDE
+.vscode
+.idea
+
+# OS
+.DS_Store
+Thumbs.db
