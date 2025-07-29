@@ -30,8 +30,6 @@ pub async fn update_forex_data(state: AppState) {
                     };
                     *state.forex_data.write().await = forex_data;
                     *state.raw_forex_data.write().await = Some(raw_data);
-                        
-                    println!("Updated forex data: {:?}", state.forex_data.read().await);
                 } else {
                     println!("Failed to parse forex JSON");
                 }
