@@ -6,6 +6,7 @@ use std::env;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tower::ServiceBuilder;
 use tower_governor::{
@@ -13,7 +14,7 @@ use tower_governor::{
 };
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{Level, error, info};
-use tracing_subscriber::{fmt, filter::EnvFilter};
+use tracing_subscriber::{filter::EnvFilter, fmt};
 
 
 mod appstate;
@@ -45,7 +46,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
     info!("Logging initialized with tracing");
-
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
     dotenvy::dotenv().map_err(|e| format!("Failed to load .env file: {}", e))?;
     info!("Loaded environment variables");
 
@@ -75,8 +78,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     let client = Client::builder()
-    .build()
-    .map_err(|e| format!("Failed to build reqwest client: {}", e))?;
+        .use_rustls_tls()
+        .pool_max_idle_per_host(10) 
+        .http2_keep_alive_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(10))
+        .gzip(true) 
+        .brotli(true)
+        .build()
+        .map_err(|e| format!("Failed to build reqwest client: {}", e))?;
     info!("Built reqwest client with rustls TLS");
 
     let state = AppState {
