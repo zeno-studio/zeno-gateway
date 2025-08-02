@@ -1,16 +1,14 @@
 use std::collections::HashMap;
-
 use axum::{
     body::Body,
     extract::{Path, Request, State},
     http::StatusCode,
     response::Response,
 };
+use crate::appstate::{AppState, ForexData, RawForexData};
+use crate::api::{RpcRequest, IndexerRequest};
+use tokio::time::Instant;
 
-
-use crate::appstate::AppState;
-
-// Initialize Ankr RPC endpoints
 pub fn setup_ankr_endpoints(rpc_endpoints: &mut HashMap<String, String>, ankr_key: &str) {
     if ankr_key.is_empty() {
         println!("Warning: ANKR_API_KEY is empty, skipping Ankr endpoints");
@@ -32,7 +30,6 @@ pub fn setup_ankr_endpoints(rpc_endpoints: &mut HashMap<String, String>, ankr_ke
     }
 }
 
-// Initialize Blast RPC endpoints
 pub fn setup_blast_endpoints(rpc_endpoints: &mut HashMap<String, String>, blast_key: &str) {
     if blast_key.is_empty() {
         println!("Warning: BLAST_API_KEY is empty, skipping Blast endpoints");
@@ -71,7 +68,6 @@ pub fn setup_blast_endpoints(rpc_endpoints: &mut HashMap<String, String>, blast_
     }
 }
 
-// Initialize indexer endpoints
 pub fn setup_indexer_endpoints(indexer_endpoints: &mut HashMap<String, String>, ankr_key: &str) {
     if ankr_key.is_empty() {
         println!("Warning: ANKR_API_KEY is empty, skipping indexer endpoints");
@@ -90,8 +86,7 @@ pub fn setup_indexer_endpoints(indexer_endpoints: &mut HashMap<String, String>, 
     }
 }
 
-// Shared proxy logic
-async fn proxy_request(
+pub async fn proxy_request(
     state: AppState,
     req: Request<Body>,
     endpoint_url: &str,
@@ -104,11 +99,9 @@ async fn proxy_request(
 
     println!("Proxying request: method={}, path={}", method, path);
 
-    // Clone headers before consuming req
     let headers = req.headers().clone();
     let method = req.method().clone();
 
-    // Read request body with size limit
     let body = match axum::body::to_bytes(req.into_body(), MAX_BODY_SIZE).await {
         Ok(body) => body,
         Err(_) => {
@@ -122,20 +115,17 @@ async fn proxy_request(
     let client = &state.client;
     let mut request_builder = client.request(method, endpoint_url);
 
-    // Copy request headers with limits
     for (name, value) in headers.iter().take(MAX_HEADER_COUNT) {
         if name != "host" && name != "content-length" && value.as_bytes().len() <= MAX_HEADER_SIZE {
             request_builder = request_builder.header(name, value);
         }
     }
 
-    // Send request
     match request_builder.body(body).send().await {
         Ok(response) => {
             let status = response.status();
             let headers = response.headers().clone();
 
-            // Read response body with size limit
             let body = match response.bytes().await {
                 Ok(body) if body.len() <= MAX_BODY_SIZE => body,
                 Ok(_) => {
@@ -154,7 +144,6 @@ async fn proxy_request(
             };
 
             let mut response_builder = Response::builder().status(status);
-            // Copy response headers with limits
             for (name, value) in headers.iter().take(MAX_HEADER_COUNT) {
                 if name != "content-length" && name != "transfer-encoding" {
                     response_builder = response_builder.header(name, value);
@@ -178,22 +167,46 @@ pub async fn rpc_proxy(
     Path((provider, chain)): Path<(String, String)>,
     req: Request<Body>,
 ) -> Response<Body> {
+    let start = Instant::now();
     let endpoint_key = format!("{}_{}", provider, chain);
-    let endpoint_url = match state.rpc_endpoints.get(&endpoint_key) {
-        Some(url) => url.to_owned(),
-        None => {
+
+    let body = match axum::body::to_bytes(req.into_body(), 1_000_000).await {
+        Ok(body) => body,
+        Err(_) => {
+            state.metrics.http_requests_total.with_label_values(&["/rpc", "POST", "413"]).inc();
             return Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Body::from("Endpoint not configured"))
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .body(Body::from("Request body too large (max 1MB)"))
                 .unwrap();
         }
     };
 
-    let path = req.uri().path().to_string();
-    let method = req.method().as_str().to_owned();
-    let endpoint_url_clone = endpoint_url.clone();
-    
-    proxy_request(state, req, &endpoint_url_clone, &path, &method).await
+    let mut client = state.rpc_client.clone();
+    let request = RpcRequest {
+        provider,
+        chain,
+        body: body.to_vec(),
+    };
+
+    match client.proxy_rpc(request).await {
+        Ok(response) => {
+            let response_body = response.into_inner().body;
+            state.metrics.grpc_requests_total.with_label_values(&["RpcService", "ProxyRpc", "200"]).inc();
+            state.metrics.grpc_request_duration.with_label_values(&["RpcService", "ProxyRpc", "200"])
+                .observe(start.elapsed().as_secs_f64());
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from(response_body))
+                .unwrap()
+        }
+        Err(e) => {
+            state.metrics.grpc_requests_total.with_label_values(&["RpcService", "ProxyRpc", "500"]).inc();
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from(format!("gRPC error: {}", e)))
+                .unwrap()
+        }
+    }
 }
 
 pub async fn indexer_proxy(
@@ -201,19 +214,108 @@ pub async fn indexer_proxy(
     Path(provider): Path<String>,
     req: Request<Body>,
 ) -> Response<Body> {
-    let endpoint_url = match state.indexer_endpoints.get(&provider) {
-        Some(url) => url.to_owned(),
-        None => {
+    let start = Instant::now();
+    let body = match axum::body::to_bytes(req.into_body(), 1_000_000).await {
+        Ok(body) => body,
+        Err(_) => {
+            state.metrics.http_requests_total.with_label_values(&["/indexer", "POST", "413"]).inc();
             return Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Body::from("Endpoint not configured"))
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .body(Body::from("Request body too large (max 1MB)"))
                 .unwrap();
         }
     };
 
-    let path = req.uri().path().to_string();
-    let method = req.method().as_str().to_owned();
-    let endpoint_url_clone = endpoint_url.clone();
-    
-    proxy_request(state, req, &endpoint_url_clone, &path, &method).await
+    let mut client = state.indexer_client.clone();
+    let request = IndexerRequest {
+        provider,
+        body: body.to_vec(),
+    };
+
+    match client.proxy_indexer(request).await {
+        Ok(response) => {
+            let response_body = response.into_inner().body;
+            state.metrics.grpc_requests_total.with_label_values(&["IndexerService", "ProxyIndexer", "200"]).inc();
+            state.metrics.grpc_request_duration.with_label_values(&["IndexerService", "ProxyIndexer", "200"])
+                .observe(start.elapsed().as_secs_f64());
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from(response_body))
+                .unwrap()
+        }
+        Err(e) => {
+            state.metrics.grpc_requests_total.with_label_values(&["IndexerService", "ProxyIndexer", "500"]).inc();
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from(format!("gRPC error: {}", e)))
+                .unwrap()
+        }
+    }
+}
+
+pub async fn forex_data(
+    State(state): State<AppState>,
+) -> Response<Body> {
+    let start = Instant::now();
+    let mut client = state.forex_client.clone();
+    let request = crate::api::GetForexDataRequest {};
+
+    match client.get_forex_data(request).await {
+        Ok(response) => {
+            let forex_data = response.into_inner();
+            state.metrics.grpc_requests_total.with_label_values(&["ForexService", "GetForexData", "200"]).inc();
+            state.metrics.grpc_request_duration.with_label_values(&["ForexService", "GetForexData", "200"])
+                .observe(start.elapsed().as_secs_f64());
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&ForexData {
+                    timestamp: forex_data.timestamp,
+                    rates: forex_data.rates,
+                }).unwrap()))
+                .unwrap()
+        }
+        Err(e) => {
+            state.metrics.grpc_requests_total.with_label_values(&["ForexService", "GetForexData", "500"]).inc();
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from(format!("gRPC error: {}", e)))
+                .unwrap()
+        }
+    }
+}
+
+pub async fn raw_forex_data(
+    State(state): State<AppState>,
+) -> Response<Body> {
+    let start = Instant::now();
+    let mut client = state.forex_client.clone();
+    let request = crate::api::GetRawForexDataRequest {};
+
+    match client.get_raw_forex_data(request).await {
+        Ok(response) => {
+            let raw_data = response.into_inner();
+            state.metrics.grpc_requests_total.with_label_values(&["ForexService", "GetRawForexData", "200"]).inc();
+            state.metrics.grpc_request_duration.with_label_values(&["ForexService", "GetRawForexData", "200"])
+                .observe(start.elapsed().as_secs_f64());
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&RawForexData {
+                    disclaimer: raw_data.disclaimer,
+                    license: raw_data.license,
+                    timestamp: raw_data.timestamp,
+                    base: raw_data.base,
+                    rates: raw_data.rates,
+                }).unwrap()))
+                .unwrap()
+        }
+        Err(e) => {
+            state.metrics.grpc_requests_total.with_label_values(&["ForexService", "GetRawForexData", "500"]).inc();
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from(format!("gRPC error: {}", e)))
+                .unwrap()
+        }
+    }
 }

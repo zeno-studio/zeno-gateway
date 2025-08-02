@@ -1,0 +1,49 @@
+syntax = "proto3";
+package api;
+
+service ForexService {
+  rpc GetForexData(GetForexDataRequest) returns (ForexDataResponse);
+  rpc GetRawForexData(GetRawForexDataRequest) returns (RawForexDataResponse);
+}
+
+service RpcService {
+  rpc ProxyRpc(RpcRequest) returns (RpcResponse);
+}
+
+service IndexerService {
+  rpc ProxyIndexer(IndexerRequest) returns (IndexerResponse);
+}
+
+message GetForexDataRequest {}
+message ForexDataResponse {
+  uint64 timestamp = 1;
+  map<string, double> rates = 2;
+}
+
+message GetRawForexDataRequest {}
+message RawForexDataResponse {
+  string disclaimer = 1;
+  string license = 2;
+  uint64 timestamp = 3;
+  string base = 4;
+  map<string, double> rates = 5;
+}
+
+message RpcRequest {
+  string provider = 1;
+  string chain = 2;
+  bytes body = 3; // JSON-RPC 请求体
+}
+
+message RpcResponse {
+  bytes body = 1; // JSON-RPC 响应体
+}
+
+message IndexerRequest {
+  string provider = 1;
+  bytes body = 2; // 请求体
+}
+
+message IndexerResponse {
+  bytes body = 1; // 响应体
+}

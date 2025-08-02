@@ -1,4 +1,4 @@
-use prometheus::{Encoder, TextEncoder, CounterVec, HistogramVec};
+use prometheus::{Encoder, TextEncoder};
 use axum::{
     body::Body,
     extract::{Request, State},
@@ -6,12 +6,8 @@ use axum::{
     response::Response,
 };
 use tokio::time::Instant;
-
 use crate::appstate::AppState;
 
-
-
-// Prometheus metrics handler
 pub async fn metrics_handler(State(state): State<AppState>) -> Response {
     let encoder = TextEncoder::new();
     let metric_families = state.metrics.registry.gather();
@@ -32,7 +28,6 @@ pub async fn metrics_handler(State(state): State<AppState>) -> Response {
     }
 }
 
-// Prometheus metrics middleware
 pub async fn metrics_middleware(
     State(state): State<AppState>,
     req: Request,
@@ -42,21 +37,17 @@ pub async fn metrics_middleware(
     let path = req.uri().path();
     let method = req.method().as_str();
 
-    // Increment request counter (exclude /metrics endpoint)
     if !path.starts_with("/metrics") {
         state.metrics.http_requests_total.with_label_values(&[path, method, "pending"]).inc();
     }
 
-    // Clone the parts we need before consuming the request
     let path_clone = path.to_owned();
     let method_clone = method.to_owned();
-    
-    // Run the next handler, consuming req
     let response = next.run(req).await;
 
-    // Record request duration
     let duration = start.elapsed().as_secs_f64();
     let status = response.status().as_u16().to_string();
     state.metrics.http_request_duration.with_label_values(&[&path_clone, &method_clone, &status]).observe(duration);
+    state.metrics.http_requests_total.with_label_values(&[&path_clone, &method_clone, &status]).inc();
     response
 }
