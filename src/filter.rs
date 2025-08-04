@@ -1,15 +1,15 @@
 use axum::{
     extract::{Request, State},
-    http::StatusCode,
+    http::{header, StatusCode},
+    middleware::Next,
     response::Response,
     body::Body,
-    middleware::Next,
 };
-use dashmap::DashMap;
-use http::header;
-use prometheus::CounterVec;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use prometheus::CounterVec;
+use std::time::{SystemTime, UNIX_EPOCH};
+use dashmap::DashMap;
+
 use crate::appstate::AppState;
 
 

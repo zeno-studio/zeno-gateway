@@ -2,48 +2,133 @@ syntax = "proto3";
 package api;
 
 service ForexService {
-  rpc GetForexData(GetForexDataRequest) returns (ForexDataResponse);
-  rpc GetRawForexData(GetRawForexDataRequest) returns (RawForexDataResponse);
+  rpc GetLatestForexData(LatestForexRequest) returns (LatestForexResponse);
 }
 
 service RpcService {
   rpc ProxyRpc(RpcRequest) returns (RpcResponse);
 }
 
-service IndexerService {
-  rpc ProxyIndexer(IndexerRequest) returns (IndexerResponse);
+service AnkrIndexerService {
+  rpc ProxyAnkrIndexer(AnkrIndexerRequest) returns (AnkrIndexerResponse);
+  rpc GetAnkrTokens(AnkrIndexerRequest) returns (AnkrTokenBalancesResponse);
+  rpc GetAnkrNfts(AnkrIndexerRequest) returns (AnkrNftBalancesResponse);
+  rpc GetAnkrTransactions(AnkrIndexerRequest) returns (AnkrTransactionsResponse );
 }
 
-message GetForexDataRequest {}
-message ForexDataResponse {
+
+message LatestForexRequest {}
+message LatestForexResponse {
   uint64 timestamp = 1;
   map<string, double> rates = 2;
 }
 
-message GetRawForexDataRequest {}
-message RawForexDataResponse {
-  string disclaimer = 1;
-  string license = 2;
-  uint64 timestamp = 3;
-  string base = 4;
-  map<string, double> rates = 5;
-}
 
 message RpcRequest {
   string provider = 1;
   string chain = 2;
-  bytes body = 3; // JSON-RPC 请求体
+  uint64 id =3;
+  string jsonrpc =4;
+  string method =5;
+  bytes params =6;
 }
 
 message RpcResponse {
-  bytes body = 1; // JSON-RPC 响应体
+  uint64 id =1;
+  string jsonrpc =2;
+  bytes result = 3; 
 }
 
-message IndexerRequest {
-  string provider = 1;
-  bytes body = 2; // 请求体
+message AnkrIndexerRequest {
+  uint64 id =1;
+  string jsonrpc =2;
+  string method =3;
+  bytes params =4;
 }
 
-message IndexerResponse {
-  bytes body = 1; // 响应体
+message AnkrIndexerResponse {
+  uint64 id =1;
+  string jsonrpc =2;
+  bytes result = 3; 
+}
+
+// NFT 列表响应
+message AnkrNftBalancesResponse {
+    message Asset {
+        string blockchain = 1;
+        string collection_name = 2;
+        string contract_address = 3;
+        int32 contract_type = 4;
+        string image_url = 5;
+        string name = 6;
+        string quantity = 7;
+        string symbol = 8;
+        string token_id = 9;
+        string token_url = 10;
+        message Trait {
+            string bunny_id = 1;
+            int32 count = 2;
+            string display_type = 3;
+            string frequency = 4;
+            string mp_score = 5;
+            string rarity = 6;
+            string trait_type = 7;
+            string value = 8;
+        }
+        repeated Trait traits = 11;
+    }
+    repeated Asset assets = 1;
+    string next_page_token = 2;
+    string owner = 3;
+    string error = 4; 
+}
+
+
+message AnkrTokenBalancesResponse {
+    message Asset {
+        string balance = 1;
+        string balance_raw_integer = 2;
+        string balance_usd = 3;
+        string blockchain = 4;
+        string contract_address = 5;
+        string holder_address = 6;
+        string thumbnail = 7;
+        int32 token_decimals = 8;
+        string token_name = 9;
+        string token_price = 10;
+        string token_symbol = 11;
+        string token_type = 12;
+    }
+    repeated Asset assets = 1;
+    string next_page_token = 2;
+    string total_balance_usd = 3;
+    string error = 4;
+}
+
+
+message AnkrTransactionsResponse {
+    message Transaction {
+        string block_hash = 1;
+        string block_number = 2;
+        string blockchain = 3;
+        string cumulative_gas_used = 4;
+        string from = 5;
+        string gas = 6;
+        string gas_price = 7;
+        string gas_used = 8;
+        string hash = 9;
+        string input = 10;
+        string nonce = 11;
+        string r = 12;
+        string s = 13;
+        string status = 14;
+        string timestamp = 15;
+        string to = 16;
+        string transaction_index = 17;
+        string type = 18;
+        string v = 19;
+        string value = 20;
+    }
+    repeated Transaction transactions = 1;
+    string error = 2;          
 }

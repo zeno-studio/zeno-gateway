@@ -35,7 +35,7 @@
 curl http://localhost:3000/metrics
 
 # HTTPS 模式（生产环境）
-curl https://localhost:8443/metrics
+curl https://localhost:443/metrics
 ```
 
 ### 2. Prometheus 配置
@@ -46,7 +46,7 @@ curl https://localhost:8443/metrics
 scrape_configs:
   - job_name: 'zeno-gateway'
     static_configs:
-      - targets: ['localhost:3000']  # 或 'localhost:8443' for HTTPS
+      - targets: ['localhost:3000']  # 或 'localhost:443' for HTTPS
     scrape_interval: 15s
     metrics_path: /metrics
 ```

@@ -65,6 +65,7 @@ podman logs -f zeno-gateway
 The following environment variables can be configured in `/etc/zeno-gateway/.env`:
 
 - `RUST_LOG`: Logging level (default: info)
+- `HTTP_PORT`: HTTPS server port (default: 8443 in development, 443 in production with Docker)
 - `ENABLE_HTTPS`: Enable HTTPS (true/false)
 - `DOMAIN`: Your domain name
 - `ACME_CONTACT`: Email for Let's Encrypt
