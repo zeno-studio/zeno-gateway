@@ -11,7 +11,6 @@ pub struct AppState {
     pub blast_key: String,
     pub openexchange_key: String,
     pub forex_data: Arc<RwLock<ForexData>>,
-    pub raw_forex_data: Arc<RwLock<Option<RawForexData>>>, // 存储原始 JSON
     pub rpc_endpoints: HashMap<String, String>,
     pub indexer_endpoints: HashMap<String, String>,
     pub metrics: PrometheusMetrics,
@@ -24,15 +23,12 @@ pub struct ForexData {
     pub rates: std::collections::HashMap<String, f64>,
 }
 
-// 原始外汇 API 响应（用于 /forex/raw）
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RawForexData {
-    pub disclaimer: String,
-    pub license: String,
     pub timestamp: u64,
-    pub base: String,
-   pub  rates: std::collections::HashMap<String, f64>,
+    pub rates: std::collections::HashMap<String, f64>,
 }
+
 
 
 #[derive(Debug, Clone,)]

@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tower::ServiceBuilder;
 use tower_governor::{
-    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
+    GovernorLayer, governor::GovernorConfigBuilder,
 };
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{Level, error, info};
@@ -29,10 +29,10 @@ mod prometheus;
 use prometheus::{metrics_handler, metrics_middleware};
 
 mod forex;
-use forex::{get_forex_data, get_raw_forex_data, update_forex_data};
+use forex::{get_forex_data, update_forex_data};
 
 mod filter;
-use filter::{add_headers, domain_filter, health_check};
+use filter::{add_headers, health_check, DeviceFingerprintKeyExtractor, RPC_RATE_LIMIT, INDEXER_RATE_LIMIT, FOREX_RATE_LIMIT, HEALTH_RATE_LIMIT, RPC_BURST_SIZE, INDEXER_BURST_SIZE, FOREX_BURST_SIZE, HEALTH_BURST_SIZE};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -96,7 +96,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             timestamp: 0,
             rates: HashMap::new(),
         })),
-        raw_forex_data: Arc::new(RwLock::new(None)),
         rpc_endpoints,
         indexer_endpoints,
         metrics: PrometheusMetrics::new(),
@@ -108,9 +107,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Spawned forex data update task");
 
     let rpc_governor_conf = GovernorConfigBuilder::default()
-        .per_second(30)
-        .burst_size(30)
-        .key_extractor(SmartIpKeyExtractor)
+        .per_second(RPC_RATE_LIMIT)
+        .burst_size(RPC_BURST_SIZE as u32)
+        .key_extractor(DeviceFingerprintKeyExtractor)
         .finish()
         .unwrap();
     let rpc_rate_limit_layer = ServiceBuilder::new().layer(GovernorLayer {
@@ -118,9 +117,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     });
 
     let indexer_governor_conf = GovernorConfigBuilder::default()
-        .per_second(10)
-        .burst_size(10)
-        .key_extractor(SmartIpKeyExtractor)
+        .per_second(INDEXER_RATE_LIMIT)
+        .burst_size(INDEXER_BURST_SIZE as u32)
+        .key_extractor(DeviceFingerprintKeyExtractor)
         .finish()
         .unwrap();
     let indexer_rate_limit_layer = ServiceBuilder::new().layer(GovernorLayer {
@@ -128,9 +127,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     });
 
     let forex_governor_conf = GovernorConfigBuilder::default()
-        .per_second(5)
-        .burst_size(5)
-        .key_extractor(SmartIpKeyExtractor)
+        .per_second(FOREX_RATE_LIMIT)
+        .burst_size(FOREX_BURST_SIZE as u32)
+        .key_extractor(DeviceFingerprintKeyExtractor)
         .finish()
         .unwrap();
     let forex_rate_limit_layer = ServiceBuilder::new().layer(GovernorLayer {
@@ -138,9 +137,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     });
 
     let health_governor_conf = GovernorConfigBuilder::default()
-        .per_second(3)
-        .burst_size(3)
-        .key_extractor(SmartIpKeyExtractor)
+        .per_second(HEALTH_RATE_LIMIT)
+        .burst_size(HEALTH_BURST_SIZE as u32)
+        .key_extractor(DeviceFingerprintKeyExtractor)
         .finish()
         .unwrap();
     let health_rate_limit_layer = ServiceBuilder::new().layer(GovernorLayer {
@@ -162,7 +161,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let forex_routes = Router::new()
         .route("/forex", get(get_forex_data))
-        .route("/forex/raw", get(get_raw_forex_data))
         .with_state(state.clone())
         .layer(forex_rate_limit_layer);
 
@@ -182,7 +180,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             metrics_middleware,
         ))
         .layer(middleware::from_fn_with_state(state.clone(), add_headers))
-        .layer(middleware::from_fn(domain_filter))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().include_headers(true))
@@ -210,16 +207,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 Err(e) => {
                     error!("Failed to load TLS certificates: {}", e);
-                    info!("Falling back to HTTP server on http://0.0.0.0:3000...");
-                    start_http_server(app).await;
+                    error!("HTTPS server failed to start. Application will exit.");
+                    std::process::exit(1);
                 }
             },
             Err(e) => {
                 error!("Cannot access certificate or key files: {}", e);
                 info!("Certificate: {}", cert_path.display());
                 info!("Private Key: {}", key_path.display());
-                info!("Falling back to HTTP server on http://0.0.0.0:3000...");
-                start_http_server(app).await;
+                error!("HTTPS server failed to start. Application will exit.");
+                std::process::exit(1);
             }
         }
     } else {
@@ -230,20 +227,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if !key_path.is_file() {
             error!("Private Key: {} (not a file)", key_path.display());
         }
-        info!("Falling back to HTTP server on http://0.0.0.0:3000...");
-        start_http_server(app).await;
+        error!("HTTPS server failed to start. Application will exit.");
+        std::process::exit(1);
     }
 
     Ok(())
-}
-
-async fn start_http_server(app: Router) {
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    info!("Server running on http://0.0.0.0:3000");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .unwrap();
 }

@@ -1,4 +1,4 @@
-use prometheus::{Encoder, TextEncoder, CounterVec, HistogramVec};
+use prometheus::{Encoder, TextEncoder};
 use axum::{
     body::Body,
     extract::{Request, State},

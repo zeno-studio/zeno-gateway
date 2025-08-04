@@ -1,8 +1,7 @@
 use axum::{
     Json,
     extract::{ State},
-    http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{IntoResponse},
 };
 
 use reqwest::Client;
@@ -29,7 +28,6 @@ pub async fn update_forex_data(state: AppState) {
                         rates: raw_data.rates.clone(),
                     };
                     *state.forex_data.write().await = forex_data;
-                    *state.raw_forex_data.write().await = Some(raw_data);
                 } else {
                     println!("Failed to parse forex JSON");
                 }
@@ -45,13 +43,3 @@ pub async fn get_forex_data(State(state): State<AppState>) -> impl IntoResponse 
     Json(state.forex_data.read().await.clone())
 }
 
-// Forex API 端点（原始数据）
-pub async fn get_raw_forex_data(State(state): State<AppState>) -> Response {
-    match state.raw_forex_data.read().await.clone() {
-        Some(data) => Json(data).into_response(),
-        None => Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .body("Forex data not available".into())
-            .unwrap(),
-    }
-}
