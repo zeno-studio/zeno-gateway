@@ -1,45 +1,16 @@
-use axum::{
-    Json,
-    extract::{ State},
-    response::{IntoResponse},
-};
+use axum::{extract::State, response::IntoResponse, Json, http::StatusCode};
+use serde_json::Value;
+use anyhow::Result;
+use crate::config::Config;
 
-use reqwest::Client;
-use tokio::time::{self, Duration};
+pub async fn get_forex(State(config): State<Config>) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let record: Option<(Value,)> = sqlx::query_as("SELECT data FROM forex_rates LIMIT 1")
+        .fetch_optional(&config.postgres_db.pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-
-
-use crate::appstate::{AppState, ForexData, RawForexData};
-
-
-// 每小时更新外汇数据
-pub async fn update_forex_data(state: AppState) {
-    let client = Client::new();
-    let url = format!(
-        "https://openexchangerates.org/api/latest.json?app_id={}",
-        state.openexchange_key
-    );
-    loop {
-        match client.get(&url).send().await {
-            Ok(resp) => {
-                if let Ok(raw_data) = resp.json::<RawForexData>().await {
-                    let forex_data = ForexData {
-                        timestamp: raw_data.timestamp,
-                        rates: raw_data.rates.clone(),
-                    };
-                    *state.forex_data.write().await = forex_data;
-                } else {
-                    println!("Failed to parse forex JSON");
-                }
-            }
-            Err(e) => println!("Failed to fetch forex data: {}", e),
-        }
-        time::sleep(Duration::from_secs(3600)).await; // 每小时更新
+    match record {
+        Some((data,)) => Ok(Json(data)),
+        None => Err((StatusCode::NOT_FOUND, "No forex data found".to_string())),
     }
 }
-
-// Forex API 端点（精简数据）
-pub async fn get_forex_data(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.forex_data.read().await.clone())
-}
-
