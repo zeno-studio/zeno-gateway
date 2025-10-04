@@ -1,9 +1,49 @@
-use prometheus::{CounterVec, HistogramVec};
+use anyhow::{Context, Result};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use reqwest::Client;
+use sqlx::postgres::PgPool;
+use sqlx::postgres::PgPoolOptions;
+
+#[derive(Clone)]
+pub struct PostgresDb {
+    pub db_url: String,
+    pub pool: PgPool,
+}
+
+impl PostgresDb {
+    pub fn new(db_url: String) -> Self {
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect_lazy(&db_url)
+            .unwrap();
+        PostgresDb { db_url, pool }
+    }
+
+    pub async fn update_db_url(&mut self, new_url: String) -> Result<()> {
+        let new_pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&new_url)
+            .await?;
+
+        // 测试写入
+        sqlx::query("CREATE TEMPORARY TABLE IF NOT EXISTS health_check (id SERIAL PRIMARY KEY)")
+            .execute(&new_pool)
+            .await?;
+        sqlx::query("INSERT INTO health_check DEFAULT VALUES")
+            .execute(&new_pool)
+            .await?;
+        sqlx::query("DROP TABLE health_check")
+            .execute(&new_pool)
+            .await?;
+
+        self.db_url = new_url;
+        self.pool = new_pool;
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct AppState {
@@ -11,11 +51,11 @@ pub struct AppState {
     pub blast_key: String,
     pub openexchange_key: String,
     pub forex_data: Arc<RwLock<ForexData>>,
-    pub raw_forex_data: Arc<RwLock<Option<RawForexData>>>, // 存储原始 JSON
     pub rpc_endpoints: HashMap<String, String>,
     pub indexer_endpoints: HashMap<String, String>,
     pub metrics: PrometheusMetrics,
     pub client: Client,
+    pub postgres_db: PostgresDb,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -24,52 +64,8 @@ pub struct ForexData {
     pub rates: std::collections::HashMap<String, f64>,
 }
 
-// 原始外汇 API 响应（用于 /forex/raw）
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RawForexData {
-    pub disclaimer: String,
-    pub license: String,
     pub timestamp: u64,
-    pub base: String,
-   pub  rates: std::collections::HashMap<String, f64>,
-}
-
-
-#[derive(Debug, Clone,)]
-pub struct PrometheusMetrics {
-    pub http_requests_total: CounterVec,
-    pub http_request_duration: HistogramVec,
-    pub registry: prometheus::Registry,
-}
-
-impl PrometheusMetrics {
-    pub fn new() -> Self {
-        let http_requests_total = CounterVec::new(
-            prometheus::Opts::new(
-                "http_requests_total",
-                "Total number of HTTP requests",
-            ),
-            &["path", "method", "status"],
-        )
-        .unwrap();
-        let http_request_duration = HistogramVec::new(
-            prometheus::HistogramOpts::new(
-                "http_request_duration_seconds",
-                "HTTP request duration in seconds",
-            )
-            .buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]),
-            &["path", "method", "status"],
-        )
-        .unwrap();
-
-        let registry = prometheus::Registry::new();
-        registry.register(Box::new(http_requests_total.clone())).unwrap();
-        registry.register(Box::new(http_request_duration.clone())).unwrap();
-
-        Self {
-            http_requests_total,
-            http_request_duration,
-            registry,
-        }
-    }
+    pub rates: std::collections::HashMap<String, f64>,
 }

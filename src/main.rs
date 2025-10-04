@@ -1,21 +1,15 @@
-use axum::{Router, middleware, routing::get};
+use axum::{Router, middleware};
 use axum_server::tls_rustls::RustlsConfig;
 use reqwest::Client;
 use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tower::ServiceBuilder;
-use tower_governor::{
-    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
-};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{Level, error, info};
-use tracing_subscriber::{filter::EnvFilter, fmt};
-
+use tracing_subscriber::{filter::EnvFilter, fmt, util::SubscriberInitExt};
 
 mod appstate;
 use appstate::{AppState, ForexData, PrometheusMetrics};
@@ -29,29 +23,34 @@ mod prometheus;
 use prometheus::{metrics_handler, metrics_middleware};
 
 mod forex;
-use forex::{get_forex_data, get_raw_forex_data, update_forex_data};
+use forex::{get_forex_data, update_forex_data};
 
 mod filter;
-use filter::{add_headers, domain_filter, health_check};
+use filter::{add_headers, health_check};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let subscriber = fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,axum=debug,tower_http=debug")),
-        )
+    // Initialize tracing
+    fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new("info,axum=debug,tower_http=debug")
+        }))
         .with_target(true)
         .with_thread_ids(true)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
+        .finish()
+        .init();
     info!("Logging initialized with tracing");
+
+    // Initialize rustls
     rustls::crypto::ring::default_provider()
         .install_default()
-        .expect("Failed to install rustls crypto provider");
+        .map_err(|e| format!("Failed to install rustls crypto provider: {:?}", e))?;
+
+    // Load environment variables
     dotenvy::dotenv().map_err(|e| format!("Failed to load .env file: {}", e))?;
     info!("Loaded environment variables");
 
+    // Retrieve API keys
     let ankr_key = env::var("ANKR_API_KEY").unwrap_or_default();
     let blast_key = env::var("BLAST_API_KEY").unwrap_or_default();
     let openexchange_key = env::var("OPENEXCHANGE_KEY").unwrap_or_default();
@@ -64,6 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         openexchange_key.len()
     );
 
+    // Initialize endpoints
     let mut rpc_endpoints = HashMap::new();
     let mut indexer_endpoints = HashMap::new();
     setup_ankr_endpoints(&mut rpc_endpoints, &ankr_key);
@@ -77,17 +77,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         indexer_endpoints.keys().collect::<Vec<_>>()
     );
 
+    // Initialize reqwest client
     let client = Client::builder()
         .use_rustls_tls()
-        .pool_max_idle_per_host(10) 
+        .pool_max_idle_per_host(10)
         .http2_keep_alive_timeout(Duration::from_secs(30))
         .timeout(Duration::from_secs(10))
-        .gzip(true) 
+        .gzip(true)
         .brotli(true)
         .build()
         .map_err(|e| format!("Failed to build reqwest client: {}", e))?;
     info!("Built reqwest client with rustls TLS");
 
+    // Initialize application state
     let state = AppState {
         ankr_key,
         blast_key,
@@ -96,7 +98,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             timestamp: 0,
             rates: HashMap::new(),
         })),
-        raw_forex_data: Arc::new(RwLock::new(None)),
         rpc_endpoints,
         indexer_endpoints,
         metrics: PrometheusMetrics::new(),
@@ -104,146 +105,90 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     info!("Initialized application state");
 
+    // Spawn forex update task
     tokio::spawn(update_forex_data(state.clone()));
     info!("Spawned forex data update task");
 
-    let rpc_governor_conf = GovernorConfigBuilder::default()
-        .per_second(30)
-        .burst_size(30)
-        .key_extractor(SmartIpKeyExtractor)
+    // Setup rate limit layers
+    let rpc_governor_conf = tower_governor::governor::GovernorConfigBuilder::default()
+        .per_second(filter::RPC_RATE_LIMIT)
+        .burst_size(filter::RPC_BURST_SIZE as u32)
+        .key_extractor(filter::DeviceFingerprintKeyExtractor)
         .finish()
         .unwrap();
-    let rpc_rate_limit_layer = ServiceBuilder::new().layer(GovernorLayer {
-        config: Arc::new(rpc_governor_conf),
-    });
+    let rpc_rate_limit_layer = tower_governor::GovernorLayer {
+        config: std::sync::Arc::new(rpc_governor_conf),
+    };
 
-    let indexer_governor_conf = GovernorConfigBuilder::default()
-        .per_second(10)
-        .burst_size(10)
-        .key_extractor(SmartIpKeyExtractor)
+    let indexer_governor_conf = tower_governor::governor::GovernorConfigBuilder::default()
+        .per_second(filter::INDEXER_RATE_LIMIT)
+        .burst_size(filter::INDEXER_BURST_SIZE as u32)
+        .key_extractor(filter::DeviceFingerprintKeyExtractor)
         .finish()
         .unwrap();
-    let indexer_rate_limit_layer = ServiceBuilder::new().layer(GovernorLayer {
-        config: Arc::new(indexer_governor_conf),
-    });
+    let indexer_rate_limit_layer = tower_governor::GovernorLayer {
+        config: std::sync::Arc::new(indexer_governor_conf),
+    };
 
-    let forex_governor_conf = GovernorConfigBuilder::default()
-        .per_second(5)
-        .burst_size(5)
-        .key_extractor(SmartIpKeyExtractor)
+    let forex_governor_conf = tower_governor::governor::GovernorConfigBuilder::default()
+        .per_second(filter::FOREX_RATE_LIMIT)
+        .burst_size(filter::FOREX_BURST_SIZE as u32)
+        .key_extractor(filter::DeviceFingerprintKeyExtractor)
         .finish()
         .unwrap();
-    let forex_rate_limit_layer = ServiceBuilder::new().layer(GovernorLayer {
-        config: Arc::new(forex_governor_conf),
-    });
+    let forex_rate_limit_layer = tower_governor::GovernorLayer {
+        config: std::sync::Arc::new(forex_governor_conf),
+    };
 
-    let health_governor_conf = GovernorConfigBuilder::default()
-        .per_second(3)
-        .burst_size(3)
-        .key_extractor(SmartIpKeyExtractor)
+    let health_governor_conf = tower_governor::governor::GovernorConfigBuilder::default()
+        .per_second(filter::HEALTH_RATE_LIMIT)
+        .burst_size(filter::HEALTH_BURST_SIZE as u32)
+        .key_extractor(filter::DeviceFingerprintKeyExtractor)
         .finish()
         .unwrap();
-    let health_rate_limit_layer = ServiceBuilder::new().layer(GovernorLayer {
-        config: Arc::new(health_governor_conf),
-    });
+    let health_rate_limit_layer = tower_governor::GovernorLayer {
+        config: std::sync::Arc::new(health_governor_conf),
+    };
 
-    let rpc_routes = Router::new()
-        .route("/rpc/{provider}/{chain}", get(rpc_proxy).post(rpc_proxy))
-        .with_state(state.clone())
-        .layer(rpc_rate_limit_layer);
-
-    let indexer_routes = Router::new()
-        .route(
-            "/indexer/{provider}",
-            get(indexer_proxy).post(indexer_proxy),
-        )
-        .with_state(state.clone())
-        .layer(indexer_rate_limit_layer);
-
-    let forex_routes = Router::new()
-        .route("/forex", get(get_forex_data))
-        .route("/forex/raw", get(get_raw_forex_data))
-        .with_state(state.clone())
-        .layer(forex_rate_limit_layer);
-
-    let health_routes = Router::new()
-        .route("/health", get(health_check))
-        .route("/metrics", get(metrics_handler))
-        .with_state(state.clone())
-        .layer(health_rate_limit_layer);
-
+    // Define routes
     let app = Router::new()
-        .merge(rpc_routes)
-        .merge(indexer_routes)
-        .merge(forex_routes)
-        .merge(health_routes)
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            metrics_middleware,
-        ))
+        .route("/rpc/{provider}/{chain}", axum::routing::get(rpc_proxy).post(rpc_proxy))
+        .route("/indexer/{provider}", axum::routing::get(indexer_proxy).post(indexer_proxy))
+        .route("/forex", axum::routing::get(get_forex_data))
+        .route("/health", axum::routing::get(health_check))
+        .route("/metrics", axum::routing::get(metrics_handler))
+        .with_state(state.clone())
+        .layer(rpc_rate_limit_layer)
+        .layer(indexer_rate_limit_layer)
+        .layer(forex_rate_limit_layer)
+        .layer(health_rate_limit_layer)
+        .layer(middleware::from_fn_with_state(state.clone(), metrics_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), add_headers))
-        .layer(middleware::from_fn(domain_filter))
+        .layer(middleware::from_fn(filter::redirect_to_https))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().include_headers(true))
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
         );
 
-    let cert_path_str = env::var("TLS_CERT_PATH").unwrap_or("./cert.pem".to_string());
-    let key_path_str = env::var("TLS_KEY_PATH").unwrap_or("./key.pem".to_string());
+    // Load TLS certificates
+    let cert_path = env::var("TLS_CERT_PATH").unwrap_or("./cert.pem".to_string());
+    let key_path = env::var("TLS_KEY_PATH").unwrap_or("./key.pem".to_string());
+    let tls_config = RustlsConfig::from_pem_file(&cert_path, &key_path)
+        .await
+        .map_err(|e| {
+            error!(
+                "Failed to load TLS certificates: cert={}, key={}, error={}",
+                cert_path, key_path, e
+            );
+            format!("Failed to load TLS certificates: {}", e)
+        })?;
 
-    let cert_path = Path::new(&cert_path_str);
-    let key_path = Path::new(&key_path_str);
-
-    if cert_path.is_file() && key_path.is_file() {
-        match std::fs::metadata(cert_path).and_then(|_| std::fs::metadata(key_path)) {
-            Ok(_) => match RustlsConfig::from_pem_file(cert_path, key_path).await {
-                Ok(tls_config) => {
-                    info!(user = ?env::var("USER"), "TLS certificates loaded successfully");
-                    info!("Certificate: {}", cert_path.display());
-                    info!("Private Key: {}", key_path.display());
-                    info!("Server running on https://0.0.0.0:8443");
-
-                    axum_server::bind_rustls("0.0.0.0:8443".parse()?, tls_config)
-                        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-                        .await?;
-                }
-                Err(e) => {
-                    error!("Failed to load TLS certificates: {}", e);
-                    info!("Falling back to HTTP server on http://0.0.0.0:3000...");
-                    start_http_server(app).await;
-                }
-            },
-            Err(e) => {
-                error!("Cannot access certificate or key files: {}", e);
-                info!("Certificate: {}", cert_path.display());
-                info!("Private Key: {}", key_path.display());
-                info!("Falling back to HTTP server on http://0.0.0.0:3000...");
-                start_http_server(app).await;
-            }
-        }
-    } else {
-        error!("Certificate or key file not found");
-        if !cert_path.is_file() {
-            error!("Certificate: {} (not a file)", cert_path.display());
-        }
-        if !key_path.is_file() {
-            error!("Private Key: {} (not a file)", key_path.display());
-        }
-        info!("Falling back to HTTP server on http://0.0.0.0:3000...");
-        start_http_server(app).await;
-    }
+    // Start HTTPS server
+    info!("Starting HTTPS server on 0.0.0.0:8443");
+    axum_server::bind_rustls("0.0.0.0:8443".parse()?, tls_config)
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+        .await?;
 
     Ok(())
-}
-
-async fn start_http_server(app: Router) {
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    info!("Server running on http://0.0.0.0:3000");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .unwrap();
 }

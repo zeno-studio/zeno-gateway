@@ -1,4 +1,5 @@
-use prometheus::{Encoder, TextEncoder, CounterVec, HistogramVec};
+use prometheus::{Encoder, TextEncoder};
+use prometheus::{CounterVec, HistogramVec};
 use axum::{
     body::Body,
     extract::{Request, State},
@@ -9,6 +10,48 @@ use tokio::time::Instant;
 
 use crate::appstate::AppState;
 
+
+#[derive(Debug, Clone)]
+pub struct PrometheusMetrics {
+    pub http_requests_total: CounterVec,
+    pub http_request_duration: HistogramVec,
+    pub registry: prometheus::Registry,
+}
+
+impl PrometheusMetrics {
+    pub fn new() -> Self {
+        let http_requests_total = CounterVec::new(
+            prometheus::Opts::new("http_requests_total", "Total number of HTTP requests"),
+            &["path", "method", "status"],
+        )
+        .unwrap();
+        let http_request_duration = HistogramVec::new(
+            prometheus::HistogramOpts::new(
+                "http_request_duration_seconds",
+                "HTTP request duration in seconds",
+            )
+            .buckets(vec![
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            ]),
+            &["path", "method", "status"],
+        )
+        .unwrap();
+
+        let registry = prometheus::Registry::new();
+        registry
+            .register(Box::new(http_requests_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(http_request_duration.clone()))
+            .unwrap();
+
+        Self {
+            http_requests_total,
+            http_request_duration,
+            registry,
+        }
+    }
+}
 
 
 // Prometheus metrics handler
