@@ -1,194 +1,125 @@
-use axum::{Router, middleware};
-use axum_server::tls_rustls::RustlsConfig;
-use reqwest::Client;
-use std::collections::HashMap;
-use std::env;
+// src/main.rs
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::RwLock;
-use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
-use tracing::{Level, error, info};
-use tracing_subscriber::{filter::EnvFilter, fmt, util::SubscriberInitExt};
 
-mod appstate;
-use appstate::{AppState, ForexData, PrometheusMetrics};
+use axum::{
+    Router,
+    extract::State,
+    routing::{get, post},
+    http::StatusCode,
+    response::IntoResponse,
+};
+use axum_server::tls_rustls::RustlsConfig;
+use tonic::transport::Server;
 
-mod endpoint;
-use endpoint::{
-    indexer_proxy, rpc_proxy, setup_ankr_endpoints, setup_blast_endpoints, setup_indexer_endpoints,
+use crate::{
+    state::AppState,
+    pb::ankr::ankr_indexer_server::{AnkrIndexerServer},
+    ankr::IndexService,
 };
 
-mod prometheus;
-use prometheus::{metrics_handler, metrics_middleware};
-
-mod forex;
-use forex::{get_forex_data, update_forex_data};
-
-mod filter;
-use filter::{add_headers, health_check};
+mod db;
+mod state;
+mod ankr;
+mod ankr_types;
+mod pb; // tonic 生成的代码在 pb/ 目录
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Initialize tracing
-    fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new("info,axum=debug,tower_http=debug")
-        }))
-        .with_target(true)
-        .with_thread_ids(true)
-        .finish()
-        .init();
-    info!("Logging initialized with tracing");
+    // 初始化日志（建议用 tracing + tracing_subscriber）
+    tracing_subscriber::fmt::init();
+    let state = Arc::new(AppState::new());
 
-    // Initialize rustls
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .map_err(|e| format!("Failed to install rustls crypto provider: {:?}", e))?;
+    // ==================== gRPC 服务 ====================
+    let grpc_addr: SocketAddr = "0.0.0.0:50052".parse()?;  // 更改端口避免冲突
+    let indexer_service = IndexService { state: state.clone() };
 
-    // Load environment variables
-    dotenvy::dotenv().map_err(|e| format!("Failed to load .env file: {}", e))?;
-    info!("Loaded environment variables");
+    let grpc_router = Server::builder()
+        .add_service(AnkrIndexerServer::new(indexer_service));
 
-    // Retrieve API keys
-    let ankr_key = env::var("ANKR_API_KEY").unwrap_or_default();
-    let blast_key = env::var("BLAST_API_KEY").unwrap_or_default();
-    let openexchange_key = env::var("OPENEXCHANGE_KEY").unwrap_or_default();
-    info!(
-        "Retrieved API keys: ankr_key={} (len={}), blast_key={} (len={}), openexchange_key=masked (len={})",
-        if ankr_key.is_empty() { "empty" } else { "set" },
-        ankr_key.len(),
-        if blast_key.is_empty() { "empty" } else { "set" },
-        blast_key.len(),
-        openexchange_key.len()
-    );
+    // ==================== Axum HTTPS JSON Gateway ====================
+    let axum_app = Router::new()
+        .route("/health", get(health_check))
+        // 下面这两个路由把 Ankr Multichain 的 JSON 接口直接代理过去（方便前端直接调用）
+        .route("/ankr_indexer", post(ankr_indexer_post))
+        .route("/ankr_indexer", get(|| async { (
+            StatusCode::METHOD_NOT_ALLOWED,
+            "Use POST for ankr_indexer"
+        )}))
+        .with_state(state.clone());
 
-    // Initialize endpoints
-    let mut rpc_endpoints = HashMap::new();
-    let mut indexer_endpoints = HashMap::new();
-    setup_ankr_endpoints(&mut rpc_endpoints, &ankr_key);
-    setup_blast_endpoints(&mut rpc_endpoints, &blast_key);
-    setup_indexer_endpoints(&mut indexer_endpoints, &ankr_key);
-    info!(
-        "Initialized {} RPC endpoints: {:?}, {} indexer endpoints: {:?}",
-        rpc_endpoints.len(),
-        rpc_endpoints.keys().collect::<Vec<_>>(),
-        indexer_endpoints.len(),
-        indexer_endpoints.keys().collect::<Vec<_>>()
-    );
+    // TLS 配置（和原来完全一样）
+    let cert_path = std::env::var("TLS_CERT_PATH").unwrap_or("./cert.pem".to_string());
+    let key_path = std::env::var("TLS_KEY_PATH").unwrap_or("./key.pem".to_string());
 
-    // Initialize reqwest client
-    let client = Client::builder()
-        .use_rustls_tls()
-        .pool_max_idle_per_host(10)
-        .http2_keep_alive_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(10))
-        .gzip(true)
-        .brotli(true)
-        .build()
-        .map_err(|e| format!("Failed to build reqwest client: {}", e))?;
-    info!("Built reqwest client with rustls TLS");
+    let https_addr: SocketAddr = "0.0.0.0:8444".parse()?;  // 更改端口避免冲突
 
-    // Initialize application state
-    let state = AppState {
-        ankr_key,
-        blast_key,
-        openexchange_key,
-        forex_data: Arc::new(RwLock::new(ForexData {
-            timestamp: 0,
-            rates: HashMap::new(),
-        })),
-        rpc_endpoints,
-        indexer_endpoints,
-        metrics: PrometheusMetrics::new(),
-        client,
-    };
-    info!("Initialized application state");
+    let grpc_handle = tokio::spawn(async move {
+        grpc_router
+            .serve(grpc_addr)
+            .await
+            .expect("gRPC server crashed");
+    });
 
-    // Spawn forex update task
-    tokio::spawn(update_forex_data(state.clone()));
-    info!("Spawned forex data update task");
-
-    // Setup rate limit layers
-    let rpc_governor_conf = tower_governor::governor::GovernorConfigBuilder::default()
-        .per_second(filter::RPC_RATE_LIMIT)
-        .burst_size(filter::RPC_BURST_SIZE as u32)
-        .key_extractor(filter::DeviceFingerprintKeyExtractor)
-        .finish()
-        .unwrap();
-    let rpc_rate_limit_layer = tower_governor::GovernorLayer {
-        config: std::sync::Arc::new(rpc_governor_conf),
+    // 尝试加载 TLS 证书，如果失败则使用 HTTP
+    let server_handle = match RustlsConfig::from_pem_file(&cert_path, &key_path).await {
+        Ok(tls_config) => {
+            tokio::spawn(async move {
+                axum_server::bind_rustls(https_addr, tls_config)
+                    .serve(axum_app.into_make_service_with_connect_info::<SocketAddr>())
+                    .await
+                    .expect("HTTPS server crashed");
+            })
+        }
+        Err(e) => {
+            tracing::warn!("Failed to load TLS cert/key: {}. Falling back to HTTP on port 8080", e);
+            let http_addr: SocketAddr = "0.0.0.0:8080".parse().expect("Invalid HTTP address");
+            tokio::spawn(async move {
+                axum_server::bind(http_addr)
+                    .serve(axum_app.into_make_service_with_connect_info::<SocketAddr>())
+                    .await
+                    .expect("HTTP server crashed");
+            })
+        }
     };
 
-    let indexer_governor_conf = tower_governor::governor::GovernorConfigBuilder::default()
-        .per_second(filter::INDEXER_RATE_LIMIT)
-        .burst_size(filter::INDEXER_BURST_SIZE as u32)
-        .key_extractor(filter::DeviceFingerprintKeyExtractor)
-        .finish()
-        .unwrap();
-    let indexer_rate_limit_layer = tower_governor::GovernorLayer {
-        config: std::sync::Arc::new(indexer_governor_conf),
-    };
-
-    let forex_governor_conf = tower_governor::governor::GovernorConfigBuilder::default()
-        .per_second(filter::FOREX_RATE_LIMIT)
-        .burst_size(filter::FOREX_BURST_SIZE as u32)
-        .key_extractor(filter::DeviceFingerprintKeyExtractor)
-        .finish()
-        .unwrap();
-    let forex_rate_limit_layer = tower_governor::GovernorLayer {
-        config: std::sync::Arc::new(forex_governor_conf),
-    };
-
-    let health_governor_conf = tower_governor::governor::GovernorConfigBuilder::default()
-        .per_second(filter::HEALTH_RATE_LIMIT)
-        .burst_size(filter::HEALTH_BURST_SIZE as u32)
-        .key_extractor(filter::DeviceFingerprintKeyExtractor)
-        .finish()
-        .unwrap();
-    let health_rate_limit_layer = tower_governor::GovernorLayer {
-        config: std::sync::Arc::new(health_governor_conf),
-    };
-
-    // Define routes
-    let app = Router::new()
-        .route("/rpc/{provider}/{chain}", axum::routing::get(rpc_proxy).post(rpc_proxy))
-        .route("/indexer/{provider}", axum::routing::get(indexer_proxy).post(indexer_proxy))
-        .route("/forex", axum::routing::get(get_forex_data))
-        .route("/health", axum::routing::get(health_check))
-        .route("/metrics", axum::routing::get(metrics_handler))
-        .with_state(state.clone())
-        .layer(rpc_rate_limit_layer)
-        .layer(indexer_rate_limit_layer)
-        .layer(forex_rate_limit_layer)
-        .layer(health_rate_limit_layer)
-        .layer(middleware::from_fn_with_state(state.clone(), metrics_middleware))
-        .layer(middleware::from_fn_with_state(state.clone(), add_headers))
-        .layer(middleware::from_fn(filter::redirect_to_https))
-        .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(DefaultMakeSpan::new().include_headers(true))
-                .on_response(DefaultOnResponse::new().level(Level::INFO)),
-        );
-
-    // Load TLS certificates
-    let cert_path = env::var("TLS_CERT_PATH").unwrap_or("./cert.pem".to_string());
-    let key_path = env::var("TLS_KEY_PATH").unwrap_or("./key.pem".to_string());
-    let tls_config = RustlsConfig::from_pem_file(&cert_path, &key_path)
-        .await
-        .map_err(|e| {
-            error!(
-                "Failed to load TLS certificates: cert={}, key={}, error={}",
-                cert_path, key_path, e
-            );
-            format!("Failed to load TLS certificates: {}", e)
-        })?;
-
-    // Start HTTPS server
-    info!("Starting HTTPS server on 0.0.0.0:8443");
-    axum_server::bind_rustls("0.0.0.0:8443".parse()?, tls_config)
-        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-        .await?;
+    // 等待任意一个崩溃就退出
+    tokio::select! {
+        _ = grpc_handle => tracing::error!("gRPC server stopped"),
+        _ = server_handle => tracing::error!("HTTP/HTTPS server stopped"),
+    }
 
     Ok(())
+}
+
+// ==================== Axum Handler（直接透传到 Ankr）====================
+async fn ankr_indexer_post(
+    State(state): State<Arc<AppState>>,
+    body: axum::extract::Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let endpoint = format!("https://rpc.ankr.com/multichain/{}", state.ankr_key);
+
+    let client = &state.client;
+    let resp = client
+        .post(&endpoint)
+        .header("Content-Type", "application/json")
+        .json(&body.0)
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) => {
+            let status = r.status();
+            let text = r.text().await.unwrap_or_default();
+            (axum::http::StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), text)
+        }
+        Err(e) => {
+            tracing::error!("Ankr request failed: {e}");
+            (StatusCode::BAD_GATEWAY, format!("Ankr error: {e}"))
+        }
+    }
+}
+
+async fn health_check() -> &'static str {
+    "OK"
 }

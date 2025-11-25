@@ -1,0 +1,88 @@
+syntax = "proto3";
+package ankr;
+
+service AnkrIndexer{
+  rpc GetTransactionHistory (AnkrTxHisRequest) returns (TxHistoryList);
+  rpc GetAssetBalance (AnkrAssetRequest) returns (HotAssetList);
+}
+
+enum Blockchain {
+  BLOCKCHAIN_UNDEFINED = 0;
+  ETH = 1;
+  ARBITRUM = 2;
+  BASE = 3;
+  LINEA = 4;
+  OPTIMISM = 5;
+  ETH_SEPOLIA = 6;
+}
+
+// number | "latest" | "earliest"
+message BlockReference {
+  oneof kind {
+    uint64 number = 1;
+    string latest = 2;      // 值必须是 "latest"
+    string earliest = 3;    // 值必须是 "earliest"
+  }
+}
+
+// ankr tx history
+message AnkrTxHisRequest {
+  BlockReference from_timestamp = 1;
+  BlockReference to_timestamp = 2;
+  repeated Blockchain blockchain = 3;
+  repeated string address = 4;
+  string page_token = 5;
+}
+
+message TransactionHistoryEntry {
+  string tx_hash = 1;
+  uint64 block_number = 2;
+  uint64 chain_id = 3;           
+  uint64 timestamp = 4;
+  string from = 5;
+  string to = 6;
+  double value = 7;
+  double gas_price = 8;
+  double gas_used = 9;
+}
+
+message TxHistoryList {
+  repeated TransactionHistoryEntry txs = 1;
+  string next_page_token = 2;
+}
+
+// ankr balance
+enum AssetsType {
+  UNKNOWN = 0;
+  CURRENCY = 1;
+  ERC20 = 2;
+  ERC721 = 3;
+  ERC1155 = 4;
+}
+
+message HotAsset {
+  uint64 chain_id = 1;
+  string address = 2;
+  string name = 3;
+  string symbol = 4;
+  uint64 decimals = 5;
+  uint64 token_id = 6;
+  string thumbnail = 7;
+  string collection = 8;
+  AssetsType assets_type = 9;
+  string contract_address = 10;
+  double balance = 11;
+  double price = 12;
+  uint64 block_number = 13;
+}
+
+message HotAssetList {
+  repeated HotAsset assets = 1;
+}
+
+message AnkrAssetRequest {
+  repeated Blockchain blockchain = 1;
+  repeated string address = 2;
+  bool only_whitelisted = 3;
+  string page_token = 5;
+}

@@ -2,5 +2,7 @@
 
 /target
 .env
+/temp
+
 
 
