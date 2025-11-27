@@ -84,10 +84,11 @@ async fn main() -> Result<()> {
       
     // 业务服务：挂载鉴权拦截器 (check JWT)  
     let indexer = IndexService { state: state.clone() };
-    let indexer_with_auth = AnkrIndexerServer::with_interceptor(indexer, auth_interceptor);
+    let state_clone = state.clone();
+    let indexer_with_auth = AnkrIndexerServer::with_interceptor(indexer, move |req| auth_interceptor(req, &state_clone));
   
     // 登录服务：不挂载拦截器 (公开)  
-    let auth = AuthServiceServer::new(AuthServiceImpl { state });
+    let auth = AuthServiceServer::new(AuthServiceImpl { state: state.clone() });
   
     // 3. 配置限流 (基于 IP)  
     // 配置：每秒允许 2 个请求，突发允许 5 个。  

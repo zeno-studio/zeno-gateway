@@ -9,17 +9,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 
 
-// ================== 配置区（只改这几行）==================
-// 1. 主控 API Key（你自己持有，泄露就换，相当于 root 权限）
-const MASTER_API_KEY: &str = "YOUR_MASTER_API_KEY_PLACEHOLDER"; // 类似 Stripe 的 sk_ 前缀
-
-// 2. JWT 签名密钥（生产用 32 字节随机，建议从环境变量读）
-const JWT_SECRET: &[u8] = b"your-32-byte-super-secret-change-me-12345678";
-
-// 3. Token 有效期（秒）
-const TOKEN_EXPIRES_IN: u64 = 900; // 15 分钟
-
-// ======================================================
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
@@ -86,7 +75,7 @@ impl AuthService for AuthServiceImpl {
 }
 
 // ================== 拦截器：零数据库版 ==================
-pub fn auth_interceptor(mut req: Request<()>) -> Result<Request<()>, Status> {
+pub fn auth_interceptor(mut req: Request<()>, state: &AppState) -> Result<Request<()>, Status> {
     let token = req.metadata()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -95,7 +84,7 @@ pub fn auth_interceptor(mut req: Request<()>) -> Result<Request<()>, Status> {
 
     let token_data = decode::<Claims>(
         token,
-        &DecodingKey::from_secret(JWT_SECRET),
+        &DecodingKey::from_secret(state.jwt_secret.as_bytes()),
         &Validation::new(jsonwebtoken::Algorithm::HS256),
     ).map_err(|e| {
         tracing::debug!("Token invalid: {}", e);
