@@ -1,23 +1,27 @@
-// src/service.rs
+// src/ankr.rs
 use crate::{
-    AppState,
-    ankr_types::{
-        Balance, GetAccountBalanceReply, GetNFTsByOwnerReply, GetTransactionsByAddressReply, Nft,
-        Transaction, Blockchain as AnkrTypesBlockchain,
-    },
     pb::ankr::{
         AnkrAssetRequest, AnkrTxHisRequest, AssetsType, HotAsset, HotAssetList,
         TransactionHistoryEntry, TxHistoryList, ankr_indexer_server::AnkrIndexer,
         BlockReference, Blockchain as PbBlockchain,
         block_reference::Kind,
     },
+    error::{Result, AppError},
+    service::IndexService,
 };
 use serde_json::Value;
 use tonic::{Request, Response, Status};
-use std::sync::Arc;
-    
-pub struct IndexService {
-    pub state: Arc<AppState>,
+
+// 辅助函数：将Blockchain枚举转换为小写字符串名称，并跳过BLOCKCHAIN_UNDEFINED
+fn blockchain_to_str(blockchain: &i32) -> Option<String> {
+    if let Ok(pb_blockchain) = PbBlockchain::try_from(*blockchain) {
+        // 跳过BLOCKCHAIN_UNDEFINED
+        if !matches!(pb_blockchain, PbBlockchain::Undefined) {
+            // 转换为小写字符串
+            return Some(pb_blockchain.as_str_name().to_lowercase());
+        }
+    }
+    None
 }
 
 fn block_ref_to_json(br: &BlockReference) -> Value {
@@ -29,38 +33,32 @@ fn block_ref_to_json(br: &BlockReference) -> Value {
     }
 }
 
-fn blockchain_to_chain_id(name: &str) -> u64 {
+fn blockchain_to_chain_id(name: &str) -> String {
     match name {
-        "eth" => 1,
-        "arbitrum" => 42161,
-        "optimism" => 10,
-        "base" => 8453,
-        "linea" => 59144,
-        "eth_sepolia" => 11155111,
-        _ => 0,
+        "eth" => "1".to_string(),
+        "arbitrum" => "42161".to_string(),
+        "optimism" => "10".to_string(),
+        "base" => "8453".to_string(),
+        "linea" => "59144".to_string(),
+        "eth_sepolia" => "11155111".to_string(),
+        _ => "0".to_string(),
     }
 }
 
-fn wei_to_eth(wei_hex: &str) -> f64 {
-    if wei_hex.is_empty() || wei_hex == "0x0" || wei_hex == "0" {
-        return 0.0;
-    }
-    let wei = u128::from_str_radix(wei_hex.strip_prefix("0x").unwrap_or(wei_hex), 16).unwrap_or(0);
-    wei as f64 / 1e18
-}
-
-fn tx_to_entry(tx: Transaction) -> Option<TransactionHistoryEntry> {
-    let chain_str = tx.blockchain.as_deref()?.to_lowercase();
+// 直接从JSON值转换为TransactionHistoryEntry
+fn tx_json_to_entry(tx_json: &Value) -> Option<TransactionHistoryEntry> {
+    let chain_str = tx_json.get("blockchain")?.as_str()?.to_lowercase();
+    
     Some(TransactionHistoryEntry {
-        tx_hash: tx.hash.unwrap_or_default(),
-        block_number: tx.block_number.parse().unwrap_or(0),
+        tx_hash: tx_json.get("hash")?.as_str().unwrap_or("").to_string(),
+        block_number: tx_json.get("blockNumber")?.as_str().unwrap_or("0").to_string(),
         chain_id: blockchain_to_chain_id(&chain_str),
-        timestamp: tx.timestamp.as_ref().and_then(|s| s.parse().ok()).unwrap_or(0),
-        from: tx.from.clone(),
-        to: tx.to.clone().unwrap_or_default(),
-        value: tx.value.parse().unwrap_or(0.0),
-        gas_price: tx.gas_price.as_ref().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0),
-        gas_used: tx.gas_used.as_ref().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0),
+        timestamp: tx_json.get("timestamp")?.as_str().unwrap_or("0").to_string(),
+        from: tx_json.get("from")?.as_str().unwrap_or("").to_string(),
+        to: tx_json.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        value: tx_json.get("value")?.as_str().unwrap_or("0").to_string(),
+        gas_price: tx_json.get("gasPrice").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
+        gas_used: tx_json.get("gasUsed").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
     })
 }
 
@@ -69,8 +67,31 @@ impl AnkrIndexer for IndexService {
     async fn get_transaction_history(
         &self,
         request: Request<AnkrTxHisRequest>,
-    ) -> Result<Response<TxHistoryList>, Status> {
-        let req = request.into_inner();
+    ) -> std::result::Result<Response<TxHistoryList>, Status> {
+        // Convert our custom error to Status
+        match self.get_transaction_history_internal(request.into_inner()).await {
+            Ok(response) => Ok(response),
+            Err(e) => Err(Status::internal(format!("Error: {}", e))),
+        }
+    }
+    
+    async fn get_asset_balance(
+        &self,
+        request: Request<AnkrAssetRequest>,
+    ) -> std::result::Result<Response<HotAssetList>, Status> {
+        // Convert our custom error to Status
+        match self.get_asset_balance_internal(request.into_inner()).await {
+            Ok(response) => Ok(response),
+            Err(e) => Err(Status::internal(format!("Error: {}", e))),
+        }
+    }
+}
+
+impl IndexService {
+    async fn get_transaction_history_internal(
+        &self,
+        req: AnkrTxHisRequest,
+    ) -> Result<Response<TxHistoryList>> {
         let mut all_entries = Vec::new();
 
         // 初始 page_token：如果客户端传 "" 或根本没传，就视为第一页
@@ -81,8 +102,14 @@ impl AnkrIndexer for IndexService {
         };
 
         loop {
+            // 过滤掉None值并收集有效的区块链名称
+            let blockchain_names: Vec<String> = req.blockchain
+                .iter()
+                .filter_map(|&b| blockchain_to_str(&b))
+                .collect();
+
             let mut body = serde_json::json!({
-                "blockchain": req.blockchain.iter().map(|&b| PbBlockchain::try_from(b).unwrap().as_str_name()).collect::<Vec<_>>(),
+                "blockchain": blockchain_names,
                 "address": &req.address[0],
                 "decodeTxData": true,
                 "includeLogs": false,
@@ -104,30 +131,37 @@ impl AnkrIndexer for IndexService {
 
             let endpoint = format!("https://rpc.ankr.com/multichain/{}", self.state.ankr_key);
 
-            let ankr_resp: GetTransactionsByAddressReply = self
+            // 直接获取JSON响应，而不反序列化为结构体
+            let ankr_resp: Value = self
                 .state
                 .client
                 .post(&endpoint)
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| Status::internal(format!("Ankr request failed: {e}")))?
+                .map_err(AppError::from)?
                 .json()
                 .await
-                .map_err(|e| Status::internal(format!("Ankr parse failed: {e}")))?;
+                .map_err(AppError::from)?;
 
-            // 转换当前页数据
-            let page_entries = ankr_resp
-                .transactions
-                .into_iter()
-                .filter_map(|tx| tx_to_entry(tx))
-                .collect::<Vec<_>>();
+            // 直接从JSON中提取交易数据
+            if let Some(transactions) = ankr_resp.get("transactions").and_then(|t| t.as_array()) {
+                let page_entries = transactions
+                    .iter()
+                    .filter_map(|tx_json| tx_json_to_entry(tx_json))
+                    .collect::<Vec<_>>();
 
-            all_entries.extend(page_entries);
+                all_entries.extend(page_entries);
+            }
 
             // 判断是否有下一页
-            if !ankr_resp.next_page_token.is_empty() {
-                current_page_token = Some(ankr_resp.next_page_token.clone());
+            let next_page_token = ankr_resp
+                .get("nextPageToken")
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+
+            if !next_page_token.is_empty() {
+                current_page_token = Some(next_page_token.to_string());
             } else {
                 // 没有下一页，退出循环
                 current_page_token = None;
@@ -152,20 +186,17 @@ impl AnkrIndexer for IndexService {
         }))
     }
     
-    async fn get_asset_balance(
+    async fn get_asset_balance_internal(
         &self,
-        request: Request<AnkrAssetRequest>,
-    ) -> Result<Response<HotAssetList>, Status> {
-        let req = request.into_inner();
+        req: AnkrAssetRequest,
+    ) -> Result<Response<HotAssetList>> {
         let endpoint = format!("https://rpc.ankr.com/multichain/{}", self.state.ankr_key);
         
         // 获取余额数据
-        let balance_entries = get_balances_by_owner(&self.state.client, &req, &endpoint).await
-            .map_err(|e| Status::internal(format!("Get balances failed: {e}")))?;
+        let balance_entries = get_balances_by_owner(&self.state.client, &req, &endpoint).await?;
         
         // 获取 NFT 数据
-        let nft_entries = get_nft_by_owner(&self.state.client, &req, &endpoint).await
-            .map_err(|e| Status::internal(format!("Get NFTs failed: {e}")))?;
+        let nft_entries = get_nft_by_owner(&self.state.client, &req, &endpoint).await?;
         
         let mut all_entries = balance_entries;
         all_entries.extend(nft_entries);
@@ -176,33 +207,26 @@ impl AnkrIndexer for IndexService {
     }
 }
 
-fn balance_to_asset(address: &str, balance: Balance) -> Option<HotAsset> {
-    let chain_str = match &balance.blockchain {
-        AnkrTypesBlockchain::Eth => "eth",
-        AnkrTypesBlockchain::Arbitrum => "arbitrum",
-        AnkrTypesBlockchain::Base => "base",
-        AnkrTypesBlockchain::Linea => "linea",
-        AnkrTypesBlockchain::Optimism => "optimism",
-        AnkrTypesBlockchain::EthSepolia => "eth_sepolia",
-    };
-    
-    let token_type = balance.token_type.clone();
-    let token_symbol = balance.token_symbol.clone();
+// 直接从JSON值转换为HotAsset (余额)
+fn balance_json_to_asset(address: &str, balance_json: &Value) -> Option<HotAsset> {
+    let chain_str = balance_json.get("blockchain")?.as_str()?.to_lowercase();
+    let token_type = balance_json.get("tokenType")?.as_str()?.to_string();
+    let token_symbol = balance_json.get("tokenSymbol")?.as_str()?.to_string();
     
     Some(HotAsset {
-        chain_id: blockchain_to_chain_id(chain_str),
+        chain_id: blockchain_to_chain_id(&chain_str),
         address: address.to_string(),
-        name: balance.token_name,
+        name: balance_json.get("tokenName")?.as_str().unwrap_or("").to_string(),
         symbol: token_symbol.clone(),
-        decimals: balance.token_decimals as u64,
-        token_id: 0,
-        thumbnail: balance.thumbnail,
+        decimals: balance_json.get("tokenDecimals")?.as_u64().unwrap_or(0).to_string(),
+        token_id: "0".to_string(),
+        thumbnail: balance_json.get("thumbnail")?.as_str().unwrap_or("").to_string(),
         collection: "".to_string(),
         assets_type: map_asset_type(token_type, token_symbol) as i32,
-        contract_address: balance.contract_address.clone().unwrap_or_default(),
-        balance: balance.balance_usd.parse().unwrap_or(0.0),
-        price: balance.token_price.parse().unwrap_or(0.0),
-        block_number: 0,
+        contract_address: balance_json.get("contractAddress").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        balance: balance_json.get("balanceUsd")?.as_str().unwrap_or("0").to_string(),
+        price: balance_json.get("tokenPrice")?.as_str().unwrap_or("0").to_string(),
+        block_number: "0".to_string(),
     })
 }
 
@@ -224,7 +248,7 @@ fn map_asset_type(asset_type: String, symbol: String) -> AssetsType {
     }
 }
 
-fn map_asset_type2(asset_type: String) -> AssetsType {
+fn map_asset_type2(asset_type: &str) -> AssetsType {
     match asset_type.to_lowercase().as_str() {
         "erc721" => AssetsType::Erc721,
         "erc1155" => AssetsType::Erc1155,
@@ -232,30 +256,25 @@ fn map_asset_type2(asset_type: String) -> AssetsType {
     }
 }
 
-fn nft_to_asset(address: &str, nft: Nft) -> Option<HotAsset> {
-    let chain_str = match &nft.blockchain {
-        AnkrTypesBlockchain::Eth => "eth",
-        AnkrTypesBlockchain::Arbitrum => "arbitrum",
-        AnkrTypesBlockchain::Base => "base",
-        AnkrTypesBlockchain::Linea => "linea",
-        AnkrTypesBlockchain::Optimism => "optimism",
-        AnkrTypesBlockchain::EthSepolia => "eth_sepolia",
-    };
+// 直接从JSON值转换为HotAsset (NFT)
+fn nft_json_to_asset(address: &str, nft_json: &Value) -> Option<HotAsset> {
+    let chain_str = nft_json.get("blockchain")?.as_str()?.to_lowercase();
+    let contract_type = nft_json.get("contractType")?.as_str()?;
     
     Some(HotAsset {
-        chain_id: blockchain_to_chain_id(chain_str),
+        chain_id: blockchain_to_chain_id(&chain_str),
         address: address.to_string(),
-        name: nft.name,
-        symbol: nft.symbol,
-        decimals: 0,
-        token_id: nft.token_id.parse().unwrap_or(0),
-        thumbnail: nft.image_url.clone(),
-        collection: nft.collection_name.clone(),
-        assets_type: map_asset_type2(format!("{:?}", nft.contract_type)) as i32,
-        contract_address: nft.contract_address.clone(),
-        balance: nft.quantity.as_ref().unwrap_or(&"0".to_string()).parse().unwrap_or(0.0),
-        price: 0.0,
-        block_number: 0,
+        name: nft_json.get("name")?.as_str().unwrap_or("").to_string(),
+        symbol: nft_json.get("symbol")?.as_str().unwrap_or("").to_string(),
+        decimals: "0".to_string(),
+        token_id: nft_json.get("tokenId")?.as_str().unwrap_or("0").to_string(),
+        thumbnail: nft_json.get("imageUrl").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        collection: nft_json.get("collectionName").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        assets_type: map_asset_type2(contract_type) as i32,
+        contract_address: nft_json.get("contractAddress")?.as_str().unwrap_or("").to_string(),
+        balance: nft_json.get("quantity").and_then(|v| v.as_str()).unwrap_or("0").to_string(),
+        price: "0".to_string(),
+        block_number: "0".to_string(),
     })
 }
 
@@ -263,7 +282,7 @@ async fn get_balances_by_owner(
     client: &reqwest::Client,
     request: &AnkrAssetRequest,
     endpoint: &str,
-) -> Result<Vec<HotAsset>, Box<dyn std::error::Error>> {
+) -> Result<Vec<HotAsset>> {
     let mut all_entries = Vec::new();
     
     // 初始 page_token：如果客户端传 "" 或根本没传，就视为第一页
@@ -274,8 +293,14 @@ async fn get_balances_by_owner(
     };
 
     loop {
+        // 过滤掉None值并收集有效的区块链名称
+        let blockchain_names: Vec<String> = request.blockchain
+            .iter()
+            .filter_map(|&b| blockchain_to_str(&b))
+            .collect();
+
         let mut body = serde_json::json!({
-            "blockchain": request.blockchain.iter().map(|&b| PbBlockchain::try_from(b).unwrap().as_str_name()).collect::<Vec<_>>(),
+            "blockchain": blockchain_names,
             "address": &request.address[0],
             "onlyWhitelisted": &request.only_whitelisted,
             "pageSize": 50,
@@ -286,30 +311,35 @@ async fn get_balances_by_owner(
             body["pageToken"] = serde_json::Value::String(token.clone());
         }
         
-        let balance_resp: GetAccountBalanceReply = client
+        // 直接获取JSON响应，而不反序列化为结构体
+        let balance_resp: Value = client
             .post(endpoint)
             .json(&body)
             .send()
-            .await?
+            .await
+            .map_err(AppError::from)?
             .json()
-            .await?;
+            .await
+            .map_err(AppError::from)?;
 
-        // 转换当前页数据
-        let page_entries = balance_resp
-            .assets
-            .into_iter()
-            .filter_map(|b| balance_to_asset(&request.address[0], b))
-            .collect::<Vec<_>>();
+        // 直接从JSON中提取余额数据
+        if let Some(assets) = balance_resp.get("assets").and_then(|t| t.as_array()) {
+            let page_entries = assets
+                .iter()
+                .filter_map(|balance_json| balance_json_to_asset(&request.address[0], balance_json))
+                .collect::<Vec<_>>();
 
-        all_entries.extend(page_entries);
+            all_entries.extend(page_entries);
+        }
 
         // 判断是否有下一页
-        if let Some(token) = &balance_resp.next_page_token {
-            if !token.is_empty() {
-                current_page_token = Some(token.clone());
-            } else {
-                break;
-            }
+        let next_page_token = balance_resp
+            .get("nextPageToken")
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+
+        if !next_page_token.is_empty() {
+            current_page_token = Some(next_page_token.to_string());
         } else {
             break;
         }
@@ -326,7 +356,7 @@ async fn get_nft_by_owner(
     client: &reqwest::Client,
     request: &AnkrAssetRequest,
     endpoint: &str,
-) -> Result<Vec<HotAsset>, Box<dyn std::error::Error>> {
+) -> Result<Vec<HotAsset>> {
     let mut all_entries = Vec::new();
 
     // 初始 page_token：如果客户端传 "" 或根本没传，就视为第一页
@@ -337,8 +367,14 @@ async fn get_nft_by_owner(
     };
 
     loop {
+        // 过滤掉None值并收集有效的区块链名称
+        let blockchain_names: Vec<String> = request.blockchain
+            .iter()
+            .filter_map(|&b| blockchain_to_str(&b))
+            .collect();
+
         let mut body = serde_json::json!({
-            "blockchain": request.blockchain.iter().map(|&b| PbBlockchain::try_from(b).unwrap().as_str_name()).collect::<Vec<_>>(),
+            "blockchain": blockchain_names,
             "address": &request.address[0],
             "pageSize": 50,
         });
@@ -348,25 +384,35 @@ async fn get_nft_by_owner(
             body["pageToken"] = serde_json::Value::String(token.clone());
         }
         
-        let nft_resp: GetNFTsByOwnerReply = client
+        // 直接获取JSON响应，而不反序列化为结构体
+        let nft_resp: Value = client
             .post(endpoint)
             .json(&body)
             .send()
-            .await?
+            .await
+            .map_err(AppError::from)?
             .json()
-            .await?;
+            .await
+            .map_err(AppError::from)?;
 
-        // 转换当前页数据
-        let page_entries = nft_resp
-            .assets
-            .into_iter()
-            .filter_map(|nft| nft_to_asset(&request.address[0], nft))
-            .collect::<Vec<_>>();
+        // 直接从JSON中提取NFT数据
+        if let Some(assets) = nft_resp.get("assets").and_then(|t| t.as_array()) {
+            let page_entries = assets
+                .iter()
+                .filter_map(|nft_json| nft_json_to_asset(&request.address[0], nft_json))
+                .collect::<Vec<_>>();
 
-        all_entries.extend(page_entries);
+            all_entries.extend(page_entries);
+        }
 
-        if !nft_resp.next_page_token.is_empty() {
-            current_page_token = Some(nft_resp.next_page_token.clone());
+        // 判断是否有下一页
+        let next_page_token = nft_resp
+            .get("nextPageToken")
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+
+        if !next_page_token.is_empty() {
+            current_page_token = Some(next_page_token.to_string());
         } else {
             break;
         }
