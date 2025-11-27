@@ -33,26 +33,26 @@ pub struct AnkrTxHisRequest {
     #[prost(string, tag = "5")]
     pub page_token: ::prost::alloc::string::String,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransactionHistoryEntry {
     #[prost(string, tag = "1")]
     pub tx_hash: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "2")]
-    pub block_number: u64,
-    #[prost(uint64, tag = "3")]
-    pub chain_id: u64,
-    #[prost(uint64, tag = "4")]
-    pub timestamp: u64,
+    #[prost(string, tag = "2")]
+    pub block_number: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub chain_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub timestamp: ::prost::alloc::string::String,
     #[prost(string, tag = "5")]
     pub from: ::prost::alloc::string::String,
     #[prost(string, tag = "6")]
     pub to: ::prost::alloc::string::String,
-    #[prost(double, tag = "7")]
-    pub value: f64,
-    #[prost(double, tag = "8")]
-    pub gas_price: f64,
-    #[prost(double, tag = "9")]
-    pub gas_used: f64,
+    #[prost(string, tag = "7")]
+    pub value: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub gas_price: ::prost::alloc::string::String,
+    #[prost(string, tag = "9")]
+    pub gas_used: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TxHistoryList {
@@ -61,20 +61,20 @@ pub struct TxHistoryList {
     #[prost(string, tag = "2")]
     pub next_page_token: ::prost::alloc::string::String,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HotAsset {
-    #[prost(uint64, tag = "1")]
-    pub chain_id: u64,
+    #[prost(string, tag = "1")]
+    pub chain_id: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub address: ::prost::alloc::string::String,
     #[prost(string, tag = "3")]
     pub name: ::prost::alloc::string::String,
     #[prost(string, tag = "4")]
     pub symbol: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "5")]
-    pub decimals: u64,
-    #[prost(uint64, tag = "6")]
-    pub token_id: u64,
+    #[prost(string, tag = "5")]
+    pub decimals: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub token_id: ::prost::alloc::string::String,
     #[prost(string, tag = "7")]
     pub thumbnail: ::prost::alloc::string::String,
     #[prost(string, tag = "8")]
@@ -83,12 +83,12 @@ pub struct HotAsset {
     pub assets_type: i32,
     #[prost(string, tag = "10")]
     pub contract_address: ::prost::alloc::string::String,
-    #[prost(double, tag = "11")]
-    pub balance: f64,
-    #[prost(double, tag = "12")]
-    pub price: f64,
-    #[prost(uint64, tag = "13")]
-    pub block_number: u64,
+    #[prost(string, tag = "11")]
+    pub balance: ::prost::alloc::string::String,
+    #[prost(string, tag = "12")]
+    pub price: ::prost::alloc::string::String,
+    #[prost(string, tag = "13")]
+    pub block_number: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct HotAssetList {

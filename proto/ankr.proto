@@ -36,14 +36,14 @@ message AnkrTxHisRequest {
 
 message TransactionHistoryEntry {
   string tx_hash = 1;
-  uint64 block_number = 2;
-  uint64 chain_id = 3;           
-  uint64 timestamp = 4;
+  string block_number = 2;
+  string chain_id = 3;           
+  string timestamp = 4;
   string from = 5;
   string to = 6;
-  double value = 7;
-  double gas_price = 8;
-  double gas_used = 9;
+  string value = 7;
+  string gas_price = 8;
+  string gas_used = 9;
 }
 
 message TxHistoryList {
@@ -61,19 +61,19 @@ enum AssetsType {
 }
 
 message HotAsset {
-  uint64 chain_id = 1;
+  string chain_id = 1;
   string address = 2;
   string name = 3;
   string symbol = 4;
-  uint64 decimals = 5;
-  uint64 token_id = 6;
+  string decimals = 5;
+  string token_id = 6;
   string thumbnail = 7;
   string collection = 8;
   AssetsType assets_type = 9;
   string contract_address = 10;
-  double balance = 11;
-  double price = 12;
-  uint64 block_number = 13;
+  string balance = 11;
+  string price = 12;
+  string block_number = 13;
 }
 
 message HotAssetList {

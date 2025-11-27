@@ -1,6 +1,6 @@
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::time::Duration;
-use anyhow::Result;
+use crate::error::Result;
 
 #[derive(Debug, Clone)]
 pub struct PostgresDb {
@@ -54,5 +54,3 @@ impl PostgresDb {
         Ok(())
     }
 }
-
-
