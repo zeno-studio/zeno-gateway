@@ -22,15 +22,18 @@ pub mod block_reference {
 /// ankr tx history
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AnkrTxHisRequest {
-    #[prost(message, optional, tag = "1")]
-    pub from_timestamp: ::core::option::Option<BlockReference>,
+    /// 客户端UUID
+    #[prost(string, tag = "1")]
+    pub uuid: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "2")]
+    pub from_timestamp: ::core::option::Option<BlockReference>,
+    #[prost(message, optional, tag = "3")]
     pub to_timestamp: ::core::option::Option<BlockReference>,
-    #[prost(enumeration = "Blockchain", repeated, tag = "3")]
+    #[prost(enumeration = "Blockchain", repeated, tag = "4")]
     pub blockchain: ::prost::alloc::vec::Vec<i32>,
-    #[prost(string, repeated, tag = "4")]
+    #[prost(string, repeated, tag = "5")]
     pub address: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, tag = "5")]
+    #[prost(string, tag = "6")]
     pub page_token: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -40,7 +43,7 @@ pub struct TransactionHistoryEntry {
     #[prost(string, tag = "2")]
     pub block_number: ::prost::alloc::string::String,
     #[prost(string, tag = "3")]
-    pub chain_id: ::prost::alloc::string::String,
+    pub blockchain: ::prost::alloc::string::String,
     #[prost(string, tag = "4")]
     pub timestamp: ::prost::alloc::string::String,
     #[prost(string, tag = "5")]
@@ -64,7 +67,7 @@ pub struct TxHistoryList {
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HotAsset {
     #[prost(string, tag = "1")]
-    pub chain_id: ::prost::alloc::string::String,
+    pub blockchain: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub address: ::prost::alloc::string::String,
     #[prost(string, tag = "3")]
@@ -79,16 +82,14 @@ pub struct HotAsset {
     pub thumbnail: ::prost::alloc::string::String,
     #[prost(string, tag = "8")]
     pub collection: ::prost::alloc::string::String,
-    #[prost(enumeration = "AssetsType", tag = "9")]
-    pub assets_type: i32,
+    #[prost(string, tag = "9")]
+    pub assets_type: ::prost::alloc::string::String,
     #[prost(string, tag = "10")]
     pub contract_address: ::prost::alloc::string::String,
     #[prost(string, tag = "11")]
     pub balance: ::prost::alloc::string::String,
     #[prost(string, tag = "12")]
     pub price: ::prost::alloc::string::String,
-    #[prost(string, tag = "13")]
-    pub block_number: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct HotAssetList {
@@ -97,13 +98,16 @@ pub struct HotAssetList {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AnkrAssetRequest {
-    #[prost(enumeration = "Blockchain", repeated, tag = "1")]
+    /// 客户端UUID
+    #[prost(string, tag = "1")]
+    pub uuid: ::prost::alloc::string::String,
+    #[prost(enumeration = "Blockchain", repeated, tag = "2")]
     pub blockchain: ::prost::alloc::vec::Vec<i32>,
-    #[prost(string, repeated, tag = "2")]
+    #[prost(string, repeated, tag = "3")]
     pub address: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(bool, tag = "3")]
+    #[prost(bool, tag = "4")]
     pub only_whitelisted: bool,
-    #[prost(string, tag = "5")]
+    #[prost(string, tag = "6")]
     pub page_token: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -143,42 +147,6 @@ impl Blockchain {
             "LINEA" => Some(Self::Linea),
             "OPTIMISM" => Some(Self::Optimism),
             "ETH_SEPOLIA" => Some(Self::EthSepolia),
-            _ => None,
-        }
-    }
-}
-/// ankr balance
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum AssetsType {
-    Unknown = 0,
-    Currency = 1,
-    Erc20 = 2,
-    Erc721 = 3,
-    Erc1155 = 4,
-}
-impl AssetsType {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unknown => "UNKNOWN",
-            Self::Currency => "CURRENCY",
-            Self::Erc20 => "ERC20",
-            Self::Erc721 => "ERC721",
-            Self::Erc1155 => "ERC1155",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "UNKNOWN" => Some(Self::Unknown),
-            "CURRENCY" => Some(Self::Currency),
-            "ERC20" => Some(Self::Erc20),
-            "ERC721" => Some(Self::Erc721),
-            "ERC1155" => Some(Self::Erc1155),
             _ => None,
         }
     }
