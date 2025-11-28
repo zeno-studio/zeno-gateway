@@ -27,17 +27,18 @@ message BlockReference {
 
 // ankr tx history
 message AnkrTxHisRequest {
-  BlockReference from_timestamp = 1;
-  BlockReference to_timestamp = 2;
-  repeated Blockchain blockchain = 3;
-  repeated string address = 4;
-  string page_token = 5;
+  string uuid = 1;                 // 客户端UUID
+  BlockReference from_timestamp = 2;
+  BlockReference to_timestamp = 3;
+  repeated Blockchain blockchain = 4;
+  repeated string address = 5;
+  string page_token = 6;
 }
 
 message TransactionHistoryEntry {
   string tx_hash = 1;
   string block_number = 2;
-  string chain_id = 3;           
+  string blockchain = 3;           
   string timestamp = 4;
   string from = 5;
   string to = 6;
@@ -51,17 +52,9 @@ message TxHistoryList {
   string next_page_token = 2;
 }
 
-// ankr balance
-enum AssetsType {
-  UNKNOWN = 0;
-  CURRENCY = 1;
-  ERC20 = 2;
-  ERC721 = 3;
-  ERC1155 = 4;
-}
 
 message HotAsset {
-  string chain_id = 1;
+  string blockchain = 1;
   string address = 2;
   string name = 3;
   string symbol = 4;
@@ -69,11 +62,10 @@ message HotAsset {
   string token_id = 6;
   string thumbnail = 7;
   string collection = 8;
-  AssetsType assets_type = 9;
+  string assets_type = 9;
   string contract_address = 10;
   string balance = 11;
   string price = 12;
-  string block_number = 13;
 }
 
 message HotAssetList {
@@ -81,8 +73,9 @@ message HotAssetList {
 }
 
 message AnkrAssetRequest {
-  repeated Blockchain blockchain = 1;
-  repeated string address = 2;
-  bool only_whitelisted = 3;
-  string page_token = 5;
+  string uuid = 1;                 // 客户端UUID
+  repeated Blockchain blockchain = 2;
+  repeated string address = 3;
+  bool only_whitelisted = 4;
+  string page_token = 6;
 }
